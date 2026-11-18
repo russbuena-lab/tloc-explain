@@ -14,7 +14,7 @@ use crate::explainer::explain_snapshot;
 use crate::models::AnalysisReport;
 use crate::parsers::build_snapshot_from_text;
 use crate::render::{render_markdown, render_terminal};
-use crate::ssh::collect_via_ssh;
+use crate::ssh::{collect_via_ssh, prompt_password_hidden, SshTarget};
 use crate::vmanage::{resolve_vmanage_credentials, VManageClient};
 
 #[derive(Debug)]
@@ -23,6 +23,8 @@ enum CommandMode {
         host: String,
         user: String,
         port: u16,
+        identity_file: Option<String>,
+        ask_pass: bool,
         password: Option<String>,
         password_env: Option<String>,
         vsmart: bool,
@@ -57,22 +59,24 @@ fn print_help() {
         r#"tloc-explain — Cisco Catalyst SD-WAN TLOC, OMP Route & Transport Preferencing Explainer
 
 USAGE:
-  tloc-explain [ssh] <host> [-u <user>] [-p <port>] [--password <pw>] [--password-env <VAR>] [--vsmart] [--vpn <id>] [--flow <spec>] [--json] [--markdown <file>] [--no-color]
+  tloc-explain [ssh] <host> [-u <user>] [-p <port>] [-i <keyfile>] [-P|--ask-pass] [--password-env <VAR>] [--vsmart] [--vpn <id>] [--flow <spec>] [--json] [--markdown <file>] [--no-color]
   tloc-explain vmanage [--host <host:port>] [--user <user>] [--device <name|sysip|all>] [--vpn <id>] [--insecure] [--json] [--markdown <file>] [--no-color]
   tloc-explain file <capture.txt> [--hostname <name>] [--system-ip <ip>] [--site-id <id>] [--json] [--markdown <file>] [--no-color]
 
 EXAMPLES:
-  tloc-explain 10.10.1.21
-  tloc-explain 10.10.1.21 -u admin --vpn 1000
+  tloc-explain 10.10.1.21 -u admin
+  tloc-explain 10.10.1.21 -u admin -P
+  tloc-explain 10.10.1.21 -u admin -i ~/.ssh/id_ed25519
   tloc-explain 172.16.1.21 --markdown /tmp/border1-report.md
   tloc-explain ssh 172.16.1.12 -u admin --vsmart
   tloc-explain file router_capture.txt --hostname site101-kit1 --system-ip 10.255.1.11 --site-id 1011
   tloc-explain vmanage --device all
 
-ENVIRONMENT:
-  Direct router SSH automatically checks TLOC_SSH_PASS and ROUTER_SSH_PASS in the
-  process environment, ~/.tloc_env, and /home/russb/code/sdwan-lab/.vmanage_env
-  (falling back to VMANAGE_PASSWORD for vSmart or shared credentials).
+AUTHENTICATION:
+  Direct SSH uses `-i <keyfile>` if given, or checks TLOC_SSH_PASS / ROUTER_SSH_PASS
+  (env, ~/.tloc_env, /home/russb/code/sdwan-lab/.vmanage_env). When no env password is
+  found or `-P` / `--ask-pass` is passed, `tloc-explain` prompts securely with hidden
+  input on `/dev/tty` (never echoed or exposed in CLI arguments).
 "#
     );
 }
@@ -92,6 +96,8 @@ fn parse_ssh_args(args: &[String]) -> Result<CliArgs, String> {
     let mut host = String::new();
     let mut user = "admin".to_string();
     let mut port = 22u16;
+    let mut identity_file = None;
+    let mut ask_pass = false;
     let mut password = None;
     let mut password_env = None;
     let mut vsmart = false;
@@ -110,6 +116,8 @@ fn parse_ssh_args(args: &[String]) -> Result<CliArgs, String> {
                 let s = take_val(args, &mut i, "--port")?;
                 port = s.parse::<u16>().map_err(|_| format!("Invalid port: {s}"))?;
             }
+            "-i" | "--identity" => identity_file = Some(take_val(args, &mut i, "--identity")?),
+            "-P" | "--ask-pass" => ask_pass = true,
             "--password" => password = Some(take_val(args, &mut i, "--password")?),
             "--password-env" => password_env = Some(take_val(args, &mut i, "--password-env")?),
             "--vsmart" => vsmart = true,
@@ -133,6 +141,8 @@ fn parse_ssh_args(args: &[String]) -> Result<CliArgs, String> {
             host,
             user,
             port,
+            identity_file,
+            ask_pass,
             password,
             password_env,
             vsmart,
@@ -333,16 +343,48 @@ fn main() {
             host,
             user,
             port,
+            identity_file,
+            ask_pass,
             password,
             password_env,
             vsmart,
             vpn,
             flow,
         } => {
-            let pw = password
-                .clone()
-                .or_else(|| load_ssh_password(password_env.as_deref(), *vsmart));
-            match collect_via_ssh(host, user, *port, pw.as_deref(), *vsmart, vpn, flow.as_deref()) {
+            let resolved_pw = if *ask_pass && identity_file.is_none() {
+                match prompt_password_hidden(&format!("Password for {user}@{host}: ")) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        eprintln!("SSH prompt error: {e}");
+                        process::exit(1);
+                    }
+                }
+            } else if let Some(p) = password.clone().filter(|s| !s.is_empty()) {
+                Some(p)
+            } else if identity_file.is_some() {
+                None
+            } else {
+                match load_ssh_password(password_env.as_deref(), *vsmart) {
+                    Some(p) => Some(p),
+                    None => match prompt_password_hidden(&format!("Password for {user}@{host}: ")) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            eprintln!("SSH auth error: {e}");
+                            process::exit(1);
+                        }
+                    },
+                }
+            };
+            match collect_via_ssh(&SshTarget {
+                host,
+                user,
+                port: *port,
+                identity_file: identity_file.as_deref(),
+                password: resolved_pw.as_deref(),
+                is_vsmart: *vsmart,
+                vpn_id: vpn,
+                flow_spec: flow.as_deref(),
+            }) {
                 Ok(snap) => vec![explain_snapshot(snap)],
                 Err(e) => {
                     eprintln!("SSH collection error: {e}");
@@ -429,5 +471,46 @@ fn main() {
             process::exit(1);
         }
         eprintln!("Wrote markdown report to {md_path}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_identity_and_ask_pass_flags() {
+        let args: Vec<String> = vec![
+            "10.10.1.21",
+            "-u",
+            "netops",
+            "-i",
+            "/home/russb/.ssh/id_ed25519",
+            "-P",
+            "--vpn",
+            "1000",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let cli = parse_ssh_args(&args).expect("valid ssh args");
+        match cli.mode {
+            CommandMode::Ssh {
+                host,
+                user,
+                identity_file,
+                ask_pass,
+                vpn,
+                ..
+            } => {
+                assert_eq!(host, "10.10.1.21");
+                assert_eq!(user, "netops");
+                assert_eq!(identity_file.as_deref(), Some("/home/russb/.ssh/id_ed25519"));
+                assert!(ask_pass);
+                assert_eq!(vpn, "1000");
+            }
+            _ => panic!("expected Ssh mode"),
+        }
     }
 }

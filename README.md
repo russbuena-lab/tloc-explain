@@ -20,7 +20,7 @@ Standalone, zero-warning Rust CLI (`x86_64-unknown-linux-musl` static binary) th
 - **Zero External Build or Runtime Crates Needed:**
   - Pure-Rust dependency tree (`serde`, `serde_json`, `regex` — zero `ring`, zero `cc`, zero OpenSSL/tokio C-toolchain requirements). All 20 crates are **vendored right in [`vendor/`](vendor/)** with [`.cargo/config.toml`](.cargo/config.toml), alongside a pre-built static [`tloc-explain`](tloc-explain) binary, [`install.sh`](install.sh), and a self-contained Debian package [`dist/tloc-explain_0.1.0_amd64.deb`](dist/tloc-explain_0.1.0_amd64.deb).
 - **Direct Router First (No vManage Required):**
-  - **Direct Router SSH (default):** `tloc-explain <router-ip>` connects straight to a `cEdge` (or `--vsmart`) via native OpenSSH with read-only `show` commands and ephemeral `0700` `SSH_ASKPASS` under `~/.cache/tloc-explain/` (safe on DISA STIG `/tmp noexec` hosts, zero password exposure on `argv`). Supports `TLOC_SSH_PASS` / `ROUTER_SSH_PASS` (env or `~/.tloc_env` / `/home/russb/code/sdwan-lab/.vmanage_env`), `--password <pw>`, or `--password-env <VAR>`.
+  - **Direct Router SSH (default):** `tloc-explain <router-ip> -u <user>` connects straight to a `cEdge` (or `--vsmart`) via native OpenSSH with read-only `show` commands. Supports SSH keys (`-i <keyfile>`), hidden interactive password prompt on `/dev/tty` (automatic when no env password is set, or explicit `-P` / `--ask-pass` with echo disabled and zero exposure on `argv`), or `TLOC_SSH_PASS` / `ROUTER_SSH_PASS` / `--password-env <VAR>`. Ephemeral `0700` `SSH_ASKPASS` runs in `~/.cache/tloc-explain/` (safe on DISA STIG `/tmp noexec` hosts).
   - **`file`:** Parses offline CLI captures cleanly.
   - **`vmanage` (optional):** Queries `vManage` real-time APIs concurrently (`std::thread::scope` + native `curl`, no `reqwest`/`rustls` crates required) across one device or `--device all`.
 
@@ -43,12 +43,15 @@ sudo dpkg -i dist/tloc-explain_0.1.0_amd64.deb
 ## Usage Examples
 
 ```bash
-# Run directly on a cEdge router over SSH (no vManage required)
-tloc-explain 10.10.1.21
-tloc-explain 172.16.1.21 -u admin --vpn 1000 --markdown /tmp/border1.md
+# Run directly on a cEdge router (interactive hidden password prompt)
+tloc-explain 10.10.1.21 -u admin
+tloc-explain 10.10.1.21 -u admin -P --vpn 1000
 
-# Explicit ssh subcommand or vSmart controller inspection
-tloc-explain ssh 10.10.1.21 --password '<pw>'
+# Authenticate with an SSH private key
+tloc-explain 10.10.1.21 -u admin -i ~/.ssh/id_ed25519
+
+# Export Markdown or inspect a vSmart controller
+tloc-explain 172.16.1.21 -u admin --vpn 1000 --markdown /tmp/border1.md
 tloc-explain 172.16.1.12 -u admin --vsmart
 
 # Analyze an offline CLI capture file

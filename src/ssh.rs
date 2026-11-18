@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -60,11 +60,79 @@ impl Drop for AskpassGuard {
     }
 }
 
+struct TtyEchoGuard {
+    tty_fd: fs::File,
+}
+
+impl TtyEchoGuard {
+    fn disable_echo() -> Result<Self, String> {
+        let tty = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .map_err(|_| {
+                "Cannot prompt for password without an interactive terminal (/dev/tty). Pass -i <keyfile> or set TLOC_SSH_PASS.".to_string()
+            })?;
+        let status = Command::new("stty")
+            .arg("-echo")
+            .stdin(Stdio::from(
+                tty.try_clone()
+                    .map_err(|e| format!("Failed cloning /dev/tty descriptor: {e}"))?,
+            ))
+            .status()
+            .map_err(|e| format!("Failed disabling terminal echo via stty: {e}"))?;
+        if !status.success() {
+            return Err("stty -echo failed on /dev/tty".to_string());
+        }
+        Ok(Self { tty_fd: tty })
+    }
+}
+
+impl Drop for TtyEchoGuard {
+    fn drop(&mut self) {
+        if let Ok(fd) = self.tty_fd.try_clone() {
+            let _ = Command::new("stty")
+                .arg("echo")
+                .stdin(Stdio::from(fd))
+                .status();
+        }
+    }
+}
+
+/// Prompts for an SSH password directly on `/dev/tty` with echo disabled, then restores echo cleanly.
+pub fn prompt_password_hidden(prompt: &str) -> Result<String, String> {
+    let guard = TtyEchoGuard::disable_echo()?;
+    let mut writer = guard
+        .tty_fd
+        .try_clone()
+        .map_err(|e| format!("Failed cloning /dev/tty for prompt: {e}"))?;
+    writer
+        .write_all(prompt.as_bytes())
+        .and_then(|_| writer.flush())
+        .map_err(|e| format!("Failed writing password prompt to /dev/tty: {e}"))?;
+
+    let reader_file = guard
+        .tty_fd
+        .try_clone()
+        .map_err(|e| format!("Failed cloning /dev/tty for input: {e}"))?;
+    let mut reader = BufReader::new(reader_file);
+    let mut line = String::new();
+    let read_res = reader.read_line(&mut line);
+
+    drop(guard);
+    let _ = writer.write_all(b"\n");
+    let _ = writer.flush();
+
+    read_res.map_err(|e| format!("Failed reading password from /dev/tty: {e}"))?;
+    Ok(line.trim_end_matches(&['\r', '\n'][..]).to_string())
+}
+
 /// Runs a batch of read-only CLI commands over native OpenSSH in a single session and returns raw stdout.
 pub fn run_ssh_commands(
     host: &str,
     user: &str,
     port: u16,
+    identity_file: Option<&str>,
     password: Option<&str>,
     commands: &[String],
     timeout_secs: u64,
@@ -87,11 +155,19 @@ pub fn run_ssh_commands(
         .arg("-o")
         .arg("ConnectTimeout=8");
 
+    if let Some(key) = identity_file.filter(|s| !s.is_empty()) {
+        cmd.arg("-i")
+            .arg(key)
+            .arg("-o")
+            .arg("IdentitiesOnly=yes");
+    }
+
     if let Some(pw) = password.filter(|s| !s.is_empty()) {
         let guard = AskpassGuard::create()?;
+        if identity_file.is_none() {
+            cmd.arg("-o").arg("PubkeyAuthentication=no");
+        }
         cmd.arg("-o")
-            .arg("PubkeyAuthentication=no")
-            .arg("-o")
             .arg("NumberOfPasswordPrompts=1")
             .env("SSH_ASKPASS", &guard.path)
             .env("SSH_ASKPASS_REQUIRE", "force")
@@ -156,17 +232,22 @@ pub fn run_ssh_commands(
     Ok(stdout)
 }
 
+/// Connection and query options for collecting read-only SD-WAN telemetry over SSH.
+pub struct SshTarget<'a> {
+    pub host: &'a str,
+    pub user: &'a str,
+    pub port: u16,
+    pub identity_file: Option<&'a str>,
+    pub password: Option<&'a str>,
+    pub is_vsmart: bool,
+    pub vpn_id: &'a str,
+    pub flow_spec: Option<&'a str>,
+}
+
 /// Collects a full `RouterSnapshot` from either an IOS-XE `cEdge` router or a `vSmart` controller over SSH.
-pub fn collect_via_ssh(
-    host: &str,
-    user: &str,
-    port: u16,
-    password: Option<&str>,
-    is_vsmart: bool,
-    vpn_id: &str,
-    flow_spec: Option<&str>,
-) -> Result<RouterSnapshot, String> {
-    let mut cmds: Vec<String> = if is_vsmart {
+pub fn collect_via_ssh(target: &SshTarget<'_>) -> Result<RouterSnapshot, String> {
+    let vpn_id = target.vpn_id;
+    let mut cmds: Vec<String> = if target.is_vsmart {
         vec![
             "paginate false".to_string(),
             "show omp tlocs".to_string(),
@@ -186,16 +267,24 @@ pub fn collect_via_ssh(
         ]
     };
 
-    if let Some(flow) = flow_spec {
+    if let Some(flow) = target.flow_spec {
         cmds.push(flow.to_string());
     }
 
-    let raw = run_ssh_commands(host, user, port, password, &cmds, 30)?;
+    let raw = run_ssh_commands(
+        target.host,
+        target.user,
+        target.port,
+        target.identity_file,
+        target.password,
+        &cmds,
+        30,
+    )?;
 
-    if is_vsmart {
+    if target.is_vsmart {
         let tlocs = parse_omp_tlocs(&raw);
         let routes = parse_omp_routes(&raw);
-        let mut snap = build_snapshot_from_text("vsmart", host, "100", "ssh-vsmart", &raw);
+        let mut snap = build_snapshot_from_text("vsmart", target.host, "100", "ssh-vsmart", &raw);
         snap.remote_tlocs = tlocs;
         snap.omp_routes = routes;
         if let Some(idx) = raw.find("apply-policy") {
@@ -204,7 +293,7 @@ pub fn collect_via_ssh(
         return Ok(snap);
     }
 
-    let (sys_ip, site_id, host_name) = extract_system_identity(&raw, host);
+    let (sys_ip, site_id, host_name) = extract_system_identity(&raw, target.host);
     Ok(build_snapshot_from_text(&host_name, &sys_ip, &site_id, "ssh", &raw))
 }
 
