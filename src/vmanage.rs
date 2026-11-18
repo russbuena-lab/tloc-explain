@@ -325,6 +325,11 @@ impl VManageClient {
         }
 
         let discovered_vpns = sort_unique_vpns(omp_routes.iter().map(|r| r.vpn_id.as_str()));
+        let target_vpn = if vpn_id.eq_ignore_ascii_case("all") || vpn_id.is_empty() {
+            discovered_vpns.first().cloned()
+        } else {
+            Some(vpn_id.to_string())
+        };
 
         Ok(RouterSnapshot {
             host_name: dev.host_name.clone(),
@@ -332,11 +337,13 @@ impl VManageClient {
             site_id: dev.site_id.clone(),
             source_mode: "vmanage".to_string(),
             captured_at_utc: utc_now_rfc3339(),
+            target_vpn,
             discovered_vpns,
             peer_filter: None,
             local_tlocs,
             remote_tlocs,
             omp_routes,
+            service_paths: Vec::new(),
             tunnels,
             policy_summary: None,
         })

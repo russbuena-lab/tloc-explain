@@ -34,8 +34,74 @@ pub fn render_terminal(report: &AnalysisReport, use_color: bool, show_all_tunnel
         snap.discovered_vpns.join(", ")
     };
     out.push_str(&format!("{c_bold}Discovered Service VPNs:{c_reset} {vpns_display}\n"));
+    if let Some(vpn) = &snap.target_vpn {
+        if !vpn.is_empty() {
+            out.push_str(&format!("{c_bold}Target Service VPN:{c_reset} {vpn}\n"));
+        }
+    }
     if let Some(peer) = &snap.peer_filter {
         out.push_str(&format!("{c_bold}Focused Peer:{c_reset} {peer}\n"));
+    }
+
+    if let Some(q0) = &report.quad_zero {
+        let site_part = if q0.winner_site_id.is_empty() {
+            String::new()
+        } else {
+            format!(" (site {})", q0.winner_site_id)
+        };
+        let local_iface_part = if !q0.local_interface.is_empty() && !q0.local_ip.is_empty() {
+            format!("{}, {}", q0.local_interface, q0.local_ip)
+        } else if !q0.local_interface.is_empty() {
+            q0.local_interface.clone()
+        } else if !q0.local_ip.is_empty() {
+            q0.local_ip.clone()
+        } else {
+            "-".to_string()
+        };
+        let lp_part = q0
+            .local_pref
+            .map(|p| format!(", Pref {p}"))
+            .unwrap_or_default();
+        let remote_ip_part = if q0.remote_ip.is_empty() {
+            "-".to_string()
+        } else {
+            q0.remote_ip.clone()
+        };
+        let rp_part = q0
+            .remote_pref
+            .map(|p| format!(", Pref {p}"))
+            .unwrap_or_default();
+        let source_tag = if q0.via_service_path {
+            "QFP service-path + RIB"
+        } else {
+            "OMP/RIB + tunnel stats"
+        };
+
+        out.push_str(&format!(
+            "\n{c_bold}{c_cyan}== Quad-Zero (0.0.0.0/0) & Primary Color Verdict =={c_reset}\n"
+        ));
+        out.push_str(&format!(
+            "  {c_bold}Target Service VPN :{c_reset} {}\n",
+            if q0.target_vpn.is_empty() { "-" } else { &q0.target_vpn }
+        ));
+        out.push_str(&format!(
+            "  {c_bold}0.0.0.0/0 Winner   :{c_reset} {c_green}{}{c_reset}{site_part}\n",
+            q0.winner_system_ip
+        ));
+        out.push_str(&format!(
+            "  {c_bold}Primary Color      :{c_reset} {c_green}{}{c_reset} ({local_iface_part}{lp_part}) -> {} ({remote_ip_part}{rp_part}) [{source_tag}]\n",
+            q0.local_color, q0.remote_color
+        ));
+        out.push_str(&format!(
+            "  {c_bold}Why It Is Primary  :{c_reset} {}\n\n",
+            q0.why
+        ));
+    } else if let Some(vpn) = &snap.target_vpn {
+        if !vpn.is_empty() {
+            out.push_str(&format!(
+                "{c_yellow}0.0.0.0/0 Verdict:{c_reset} No active 0.0.0.0/0 default route detected in Service VPN {vpn}.\n"
+            ));
+        }
     }
 
     if report.active_primary_tunnels.is_empty() {
@@ -264,10 +330,64 @@ pub fn render_markdown(report: &AnalysisReport, show_all_tunnels: bool) -> Strin
         snap.source_mode,
         snap.captured_at_utc
     ));
+    if let Some(vpn) = &snap.target_vpn {
+        if !vpn.is_empty() {
+            md.push_str(&format!("- **Target Service VPN:** `{vpn}`\n"));
+        }
+    }
     if let Some(peer) = &snap.peer_filter {
         md.push_str(&format!("- **Focused Peer:** `{peer}`\n"));
     }
     md.push('\n');
+
+    if let Some(q0) = &report.quad_zero {
+        let site_part = if q0.winner_site_id.is_empty() {
+            String::new()
+        } else {
+            format!(" (site `{}`)", q0.winner_site_id)
+        };
+        let local_iface_part = if !q0.local_interface.is_empty() && !q0.local_ip.is_empty() {
+            format!("{}, {}", q0.local_interface, q0.local_ip)
+        } else if !q0.local_interface.is_empty() {
+            q0.local_interface.clone()
+        } else {
+            non_empty(&q0.local_ip, "-").to_string()
+        };
+        let lp_part = q0
+            .local_pref
+            .map(|p| format!(", Pref {p}"))
+            .unwrap_or_default();
+        let rp_part = q0
+            .remote_pref
+            .map(|p| format!(", Pref {p}"))
+            .unwrap_or_default();
+        let source_tag = if q0.via_service_path {
+            "QFP service-path + RIB"
+        } else {
+            "OMP/RIB + tunnel stats"
+        };
+
+        md.push_str("## Quad-Zero (`0.0.0.0/0`) & Primary Color Verdict\n\n");
+        md.push_str(&format!(
+            "- **Target Service VPN:** `{}`\n",
+            non_empty(&q0.target_vpn, "-")
+        ));
+        md.push_str(&format!(
+            "- **0.0.0.0/0 Winner:** `{}`{}\n",
+            q0.winner_system_ip, site_part
+        ));
+        md.push_str(&format!(
+            "- **Primary Color:** `{}` (`{}`{}) -> `{}` (`{}`{}) [{}]\n",
+            q0.local_color,
+            local_iface_part,
+            lp_part,
+            q0.remote_color,
+            non_empty(&q0.remote_ip, "-"),
+            rp_part,
+            source_tag
+        ));
+        md.push_str(&format!("- **Why It Is Primary:** {}\n\n", q0.why));
+    }
 
     md.push_str("## Remote Peers Summary\n\n");
     md.push_str("| Peer System IP | Site ID | BFD (`Up/Tot`) | OMP (`C,I,R / R`) | Data (`3m / Cumul`) | Colors | Remote WAN IPs |\n");

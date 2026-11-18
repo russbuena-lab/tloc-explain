@@ -2,22 +2,33 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use regex::Regex;
 
-use crate::models::{utc_now_rfc3339, OmpRouteEntry, RouterSnapshot, TlocEntry, TunnelDiag};
+use crate::models::{
+    utc_now_rfc3339, OmpRouteEntry, RouterSnapshot, ServicePathHop, TlocEntry, TunnelDiag,
+};
 
-/// Parses `show vrf` output into sorted Service VPN / VRF identifiers, excluding IOS-XE internal
-/// management/loopback VRFs (`65528`, `65529`, `Mgmt-intf`, `Mgmt-vrf`).
-pub fn parse_vrfs(text: &str) -> Vec<String> {
-    let mut vpns = Vec::new();
+fn is_internal_vrf(name: &str) -> bool {
+    matches!(name, "65528" | "65529")
+        || name.eq_ignore_ascii_case("mgmt-intf")
+        || name.eq_ignore_ascii_case("mgmt-vrf")
+}
+
+/// Parses `show vrf` output into `(vrf_name, interfaces)` pairs, excluding internal IOS-XE VRFs
+/// (`65528`, `65529`, `Mgmt-intf`, `Mgmt-vrf`).
+pub fn parse_vrf_table(text: &str) -> BTreeMap<String, Vec<String>> {
+    let mut table: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut in_vrf_table = false;
+    let mut last_vrf = String::new();
 
     for raw in text.lines() {
         let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed.contains('#') {
             in_vrf_table = false;
+            last_vrf.clear();
             continue;
         }
         if trimmed.contains("Name") && trimmed.contains("Default RD") {
             in_vrf_table = true;
+            last_vrf.clear();
             continue;
         }
         if !in_vrf_table {
@@ -26,26 +37,252 @@ pub fn parse_vrfs(text: &str) -> Vec<String> {
         if trimmed.starts_with('-') {
             continue;
         }
+
+        let leading_ws = raw.len().saturating_sub(raw.trim_start().len());
         let tokens: Vec<&str> = trimmed.split_whitespace().collect();
         if tokens.is_empty() {
             continue;
         }
-        let name = tokens[0];
-        if matches!(name, "65528" | "65529")
-            || name.eq_ignore_ascii_case("mgmt-intf")
-            || name.eq_ignore_ascii_case("mgmt-vrf")
-        {
-            continue;
-        }
-        // Only treat VRF table rows (second column is `<not set>` or RD like `100:1`) as VRFs
+
         if tokens.len() >= 2 && (trimmed.contains("<not set>") || tokens[1].contains(':')) {
-            vpns.push(name.to_string());
+            let name = tokens[0];
+            if is_internal_vrf(name) {
+                last_vrf.clear();
+                continue;
+            }
+            // Columns: Name, Default RD (<not set> is 2 tokens!), Protocols, Interfaces...
+            let proto_idx = if tokens.len() >= 3 && tokens[1] == "<not" && tokens[2] == "set>" {
+                3
+            } else {
+                2
+            };
+            let ifaces: Vec<String> = tokens
+                .get(proto_idx + 1..)
+                .unwrap_or(&[])
+                .iter()
+                .map(|s| s.trim_end_matches(',').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            table.entry(name.to_string()).or_default().extend(ifaces);
+            last_vrf = name.to_string();
+        } else if !last_vrf.is_empty() && leading_ws >= 20 {
+            let ifaces: Vec<String> = tokens
+                .iter()
+                .map(|s| s.trim_end_matches(',').to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            table.entry(last_vrf.clone()).or_default().extend(ifaces);
         } else {
             in_vrf_table = false;
+            last_vrf.clear();
         }
     }
 
-    sort_unique_vpns(vpns.iter().map(String::as_str))
+    table
+}
+
+/// Parses `show vrf` output into sorted Service VPN / VRF identifiers, excluding IOS-XE internal
+/// management/loopback VRFs (`65528`, `65529`, `Mgmt-intf`, `Mgmt-vrf`).
+pub fn parse_vrfs(text: &str) -> Vec<String> {
+    let table = parse_vrf_table(text);
+    sort_unique_vpns(table.keys().map(String::as_str))
+}
+
+/// Expands IOS-XE abbreviated interface names (e.g. `Gi3` -> `GigabitEthernet3`,
+/// `Vl10` -> `Vlan10`, `Gi0/0/1.10` -> `GigabitEthernet0/0/1.10`).
+pub fn expand_iosxe_interface_name(short: &str) -> String {
+    const ABBREVS: &[(&str, &str)] = &[
+        ("GigabitEthernet", "GigabitEthernet"),
+        ("TenGigabitEthernet", "TenGigabitEthernet"),
+        ("TwoGigabitEthernet", "TwoGigabitEthernet"),
+        ("FortyGigabitEthernet", "FortyGigabitEthernet"),
+        ("HundredGigE", "HundredGigE"),
+        ("FastEthernet", "FastEthernet"),
+        ("Port-channel", "Port-channel"),
+        ("Loopback", "Loopback"),
+        ("Tunnel", "Tunnel"),
+        ("Vlan", "Vlan"),
+        ("Dialer", "Dialer"),
+        ("Cellular", "Cellular"),
+        ("BDI", "BDI"),
+        ("Gi", "GigabitEthernet"),
+        ("Te", "TenGigabitEthernet"),
+        ("Tw", "TwoGigabitEthernet"),
+        ("Fo", "FortyGigabitEthernet"),
+        ("Hu", "HundredGigE"),
+        ("Fa", "FastEthernet"),
+        ("Po", "Port-channel"),
+        ("Lo", "Loopback"),
+        ("Tu", "Tunnel"),
+        ("Vl", "Vlan"),
+        ("Di", "Dialer"),
+        ("Ce", "Cellular"),
+    ];
+    let trimmed = short.trim().trim_end_matches(',');
+    for (prefix, full) in ABBREVS {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            if rest.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                return format!("{full}{rest}");
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Parses `show ip interface brief` into `InterfaceName -> IPv4` for UP interfaces with valid IPs.
+pub fn parse_ip_int_brief(text: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for raw in text.lines() {
+        let tokens: Vec<&str> = raw.split_whitespace().collect();
+        if tokens.len() < 6 || !is_ipv4(tokens[1]) {
+            continue;
+        }
+        let protocol = tokens.last().copied().unwrap_or("");
+        if !protocol.eq_ignore_ascii_case("up") {
+            continue;
+        }
+        map.insert(tokens[0].to_string(), tokens[1].to_string());
+    }
+    map
+}
+
+/// Resolves an active LAN/service interface name (full IOS-XE name) and IPv4 address for `vpn_id`
+/// by correlating `show vrf` with `show ip interface brief`.
+pub fn resolve_vrf_lan_interface_and_ip(text: &str, vpn_id: &str) -> Option<(String, String)> {
+    let vrf_table = parse_vrf_table(text);
+    let ip_brief = parse_ip_int_brief(text);
+    let ifaces = vrf_table.get(vpn_id)?;
+
+    let mut fallback: Option<(String, String)> = None;
+    for raw_if in ifaces {
+        let expanded = expand_iosxe_interface_name(raw_if);
+        let found = ip_brief
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(&expanded) || k.eq_ignore_ascii_case(raw_if));
+        if let Some((iface, ip)) = found {
+            if !iface.to_ascii_lowercase().starts_with("loopback") {
+                return Some((iface.clone(), ip.clone()));
+            }
+            if fallback.is_none() {
+                fallback = Some((iface.clone(), ip.clone()));
+            }
+        }
+    }
+    fallback
+}
+
+/// Parses `show ip route vrf <vpn> 0.0.0.0 0.0.0.0` RIB entries into OMP `C,I,R` `0.0.0.0/0` routes.
+pub fn parse_ip_route_quad_zero(text: &str, default_vpn: &str) -> Vec<OmpRouteEntry> {
+    let mut cur_vpn = default_vpn.trim().to_string();
+    let mut in_quad = false;
+    let mut proto = String::new();
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.contains('#') {
+            if trimmed.contains('#') {
+                in_quad = false;
+                proto.clear();
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Routing Table:") {
+            cur_vpn = rest.trim().to_string();
+            in_quad = false;
+            proto.clear();
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Routing entry for ") {
+            in_quad = rest.trim_start().starts_with("0.0.0.0/0");
+            proto.clear();
+            continue;
+        }
+        if !in_quad {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("Known via \"") {
+            if let Some((p, _)) = rest.split_once('"') {
+                proto = p.to_ascii_lowercase();
+            }
+            continue;
+        }
+        if proto == "omp" && trimmed.contains("Sdwan-system-intf") {
+            let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+            if let Some(nh_ip) = tokens
+                .iter()
+                .map(|t| t.trim_end_matches(','))
+                .find(|t| is_ipv4(t))
+            {
+                let vpn_val = if cur_vpn.is_empty() {
+                    default_vpn.to_string()
+                } else {
+                    cur_vpn.clone()
+                };
+                if seen.insert((vpn_val.clone(), nh_ip.to_string())) {
+                    out.push(OmpRouteEntry {
+                        vpn_id: vpn_val,
+                        prefix: "0.0.0.0/0".to_string(),
+                        from_peer: nh_ip.to_string(),
+                        originator: nh_ip.to_string(),
+                        next_hop_tloc_ip: nh_ip.to_string(),
+                        site_id: String::new(),
+                        color: String::new(),
+                        encap: "ipsec".to_string(),
+                        status: "C,I,R".to_string(),
+                        protocol: "omp".to_string(),
+                        is_chosen_installed: true,
+                        is_redistributed: false,
+                    });
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Parses `show sdwan policy service-path ...` next-hop tunnel details.
+pub fn parse_service_path_output(text: &str) -> Vec<ServicePathHop> {
+    let mut hops = Vec::new();
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if !(trimmed.contains("Source:") && trimmed.contains("Destination:")) {
+            continue;
+        }
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        let mut hop = ServicePathHop::default();
+        let mut i = 0usize;
+        while i < tokens.len() {
+            if tokens[i] == "Source:" && i + 1 < tokens.len() {
+                hop.local_ip = tokens[i + 1].to_string();
+                i += 2;
+            } else if tokens[i] == "Destination:" && i + 1 < tokens.len() {
+                hop.remote_ip = tokens[i + 1].to_string();
+                i += 2;
+            } else if tokens[i] == "Local" && i + 2 < tokens.len() && tokens[i + 1] == "Color:" {
+                hop.local_color = tokens[i + 2].to_string();
+                i += 3;
+            } else if tokens[i] == "Remote" && i + 2 < tokens.len() && tokens[i + 1] == "Color:" {
+                hop.remote_color = tokens[i + 2].to_string();
+                i += 3;
+            } else if tokens[i] == "Remote"
+                && i + 3 < tokens.len()
+                && tokens[i + 1] == "System"
+                && tokens[i + 2] == "IP:"
+            {
+                hop.remote_system_ip = tokens[i + 3].to_string();
+                i += 4;
+            } else {
+                i += 1;
+            }
+        }
+        if !hop.remote_system_ip.is_empty() || !hop.remote_ip.is_empty() {
+            hops.push(hop);
+        }
+    }
+    hops
 }
 
 /// Deduplicates and sorts Service VPN IDs numerically first, then lexicographically.
@@ -709,7 +946,60 @@ pub fn build_snapshot_from_text(
     let app_stats = parse_app_route_stats(text);
     let bfd_list = parse_bfd_sessions(text);
     let all_tlocs = parse_omp_tlocs(text);
-    let omp_routes = parse_omp_routes(text);
+    let mut omp_routes = parse_omp_routes(text);
+    let service_paths = parse_service_path_output(text);
+
+    let vrfs = parse_vrfs(text);
+    let rib_vpn = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Routing Table:").map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty());
+    let default_vpn = rib_vpn
+        .clone()
+        .or_else(|| vrfs.first().cloned())
+        .or_else(|| omp_routes.first().map(|r| r.vpn_id.clone()))
+        .unwrap_or_default();
+
+    if omp_routes.is_empty() {
+        let mut rib_routes = parse_ip_route_quad_zero(text, &default_vpn);
+        if rib_routes.is_empty() && !service_paths.is_empty() {
+            for hop in &service_paths {
+                rib_routes.push(OmpRouteEntry {
+                    vpn_id: if default_vpn.is_empty() { "-".to_string() } else { default_vpn.clone() },
+                    prefix: "0.0.0.0/0".to_string(),
+                    from_peer: hop.remote_system_ip.clone(),
+                    originator: hop.remote_system_ip.clone(),
+                    next_hop_tloc_ip: hop.remote_system_ip.clone(),
+                    site_id: String::new(),
+                    color: hop.remote_color.clone(),
+                    encap: "ipsec".to_string(),
+                    status: "C,I,R".to_string(),
+                    protocol: "omp".to_string(),
+                    is_chosen_installed: true,
+                    is_redistributed: false,
+                });
+            }
+        } else if !service_paths.is_empty() {
+            let mut expanded = Vec::new();
+            for r in rib_routes {
+                let matching_hops: Vec<&ServicePathHop> = service_paths
+                    .iter()
+                    .filter(|h| h.remote_system_ip == r.originator)
+                    .collect();
+                if matching_hops.is_empty() {
+                    expanded.push(r);
+                } else {
+                    for h in matching_hops {
+                        let mut clone = r.clone();
+                        clone.color = h.remote_color.clone();
+                        expanded.push(clone);
+                    }
+                }
+            }
+            rib_routes = expanded;
+        }
+        omp_routes = rib_routes;
+    }
 
     let mut inferred_host = host_name.to_string();
     if inferred_host.is_empty() {
@@ -799,11 +1089,13 @@ pub fn build_snapshot_from_text(
         local_tlocs.extend(seen.into_values());
     }
 
-    let mut vpn_refs: Vec<String> = parse_vrfs(text);
+    let mut vpn_refs: Vec<String> = vrfs;
     for r in &omp_routes {
         vpn_refs.push(r.vpn_id.clone());
     }
     let discovered_vpns = sort_unique_vpns(vpn_refs.iter().map(String::as_str));
+    let target_vpn = rib_vpn
+        .or_else(|| discovered_vpns.first().cloned());
 
     RouterSnapshot {
         host_name: inferred_host,
@@ -811,11 +1103,13 @@ pub fn build_snapshot_from_text(
         site_id: site_id.to_string(),
         source_mode: source_mode.to_string(),
         captured_at_utc: utc_now_rfc3339(),
+        target_vpn,
         discovered_vpns,
         peer_filter: None,
         local_tlocs,
         remote_tlocs,
         omp_routes,
+        service_paths,
         tunnels,
         policy_summary: None,
     }

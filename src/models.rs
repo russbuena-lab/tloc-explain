@@ -46,6 +46,15 @@ pub fn runtime_scratch_dir() -> PathBuf {
     std::env::temp_dir()
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServicePathHop {
+    pub local_ip: String,
+    pub remote_ip: String,
+    pub local_color: String,
+    pub remote_color: String,
+    pub remote_system_ip: String,
+}
+
 /// Normalized snapshot of a Cisco Catalyst SD-WAN router's TLOCs, OMP routes, BFD sessions,
 /// cumulative tunnel statistics, and rolling app-route SLA statistics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -55,11 +64,13 @@ pub struct RouterSnapshot {
     pub site_id: String,
     pub source_mode: String,
     pub captured_at_utc: String,
+    pub target_vpn: Option<String>,
     pub discovered_vpns: Vec<String>,
     pub peer_filter: Option<String>,
     pub local_tlocs: Vec<TlocEntry>,
     pub remote_tlocs: Vec<TlocEntry>,
     pub omp_routes: Vec<OmpRouteEntry>,
+    pub service_paths: Vec<ServicePathHop>,
     pub tunnels: Vec<TunnelDiag>,
     pub policy_summary: Option<String>,
 }
@@ -230,9 +241,26 @@ pub struct PeerSummary {
     pub remote_ips: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct QuadZeroVerdict {
+    pub target_vpn: String,
+    pub winner_system_ip: String,
+    pub winner_site_id: String,
+    pub local_color: String,
+    pub local_ip: String,
+    pub local_interface: String,
+    pub local_pref: Option<u32>,
+    pub remote_color: String,
+    pub remote_ip: String,
+    pub remote_pref: Option<u32>,
+    pub via_service_path: bool,
+    pub why: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisReport {
     pub snapshot: RouterSnapshot,
+    pub quad_zero: Option<QuadZeroVerdict>,
     pub active_primary_tunnels: Vec<String>,
     pub peer_summaries: Vec<PeerSummary>,
     pub tunnel_verdicts: Vec<TunnelVerdict>,

@@ -30,6 +30,7 @@ enum CommandMode {
         vsmart: bool,
         vpn: String,
         discover: bool,
+        full_omp: bool,
         flow: Option<String>,
         timeout_secs: u64,
         debug: bool,
@@ -111,21 +112,23 @@ fn print_help() {
         r#"tloc-explain — Cisco Catalyst SD-WAN TLOC, OMP Route & Transport Preferencing Explainer
 
 USAGE:
-  tloc-explain [ssh] <host> [-u <user>] [-p <port>] [-i <keyfile>] [-P|--ask-pass] [--password-env <VAR>] [--peer <sys-ip|wan-ip>] [--vpn <id|all>] [--discover] [--all-tunnels] [--timeout <secs>] [-v|--debug] [--vsmart] [--flow <spec>] [--json] [--markdown <file>] [--no-color]
+  tloc-explain [ssh] <host> [-u <user>] [-p <port>] [-i <keyfile>] [-P|--ask-pass] [--password-env <VAR>] [--peer <sys-ip|wan-ip>] [--vpn <id|all>] [--discover] [--full-omp] [--all-tunnels] [--timeout <secs>] [-v|--debug] [--vsmart] [--flow <spec>] [--json] [--markdown <file>] [--no-color]
   tloc-explain vmanage [--host <host:port>] [--user <user>] [--device <name|sysip|all>] [--peer <ip>] [--vpn <id|all>] [--all-tunnels] [--insecure] [--json] [--markdown <file>] [--no-color]
   tloc-explain file <capture.txt> [--hostname <name>] [--system-ip <ip>] [--site-id <id>] [--peer <ip>] [--all-tunnels] [--json] [--markdown <file>] [--no-color]
 
 EXAMPLES:
+  # Fast default 0.0.0.0/0 & primary color verdict for one Service VPN (uses RIB + QFP service-path, skips slow OMP dumps):
+  tloc-explain 10.10.1.21 -u admin --vpn 1000
+  tloc-explain 10.10.1.21 -u admin
+
   # Fast ~3s discovery of active Service VPNs and remote peers on a hub/branch:
   tloc-explain 10.10.1.21 -u admin --discover
 
-  # Focus full analysis (and router-side app-route stats) on one peer & Service VPN:
-  tloc-explain 10.10.1.21 -u admin --peer 10.255.1.1
-  tloc-explain 10.10.1.21 -u admin --peer 10.255.1.1 --vpn 10
+  # Focus full analysis (and router-side app-route stats) on a specific peer & Service VPN:
+  tloc-explain 10.10.1.21 -u admin --vpn 1000 --peer 10.255.1.1
 
-  # Default auto-discovers all Service VPNs and summarizes large standby tunnel sets:
-  tloc-explain 10.10.1.21 -u admin --timeout 180 -v
-  tloc-explain 10.10.1.21 -u admin -i ~/.ssh/id_ed25519 --all-tunnels
+  # Include full OMP route/TLOC tables (may be slow on large production routing tables):
+  tloc-explain 10.10.1.21 -u admin --vpn 1000 --full-omp --timeout 180 -v
   tloc-explain ssh 172.16.1.12 -u admin --vsmart
 
 AUTHENTICATION & DIAGNOSTICS:
@@ -158,6 +161,7 @@ fn parse_ssh_args(args: &[String]) -> Result<CliArgs, String> {
     let mut vsmart = false;
     let mut vpn = "all".to_string();
     let mut discover = false;
+    let mut full_omp = false;
     let mut flow = None;
     let mut timeout_secs = 120u64;
     let mut debug = false;
@@ -193,6 +197,7 @@ fn parse_ssh_args(args: &[String]) -> Result<CliArgs, String> {
             "--vsmart" => vsmart = true,
             "--vpn" => vpn = take_val(args, &mut i, "--vpn")?,
             "--discover" => discover = true,
+            "--full-omp" => full_omp = true,
             "--flow" => flow = Some(take_val(args, &mut i, "--flow")?),
             arg if !arg.starts_with('-') && host.is_empty() => host = arg.to_string(),
             other => return Err(format!("Unknown argument: {other}")),
@@ -216,6 +221,7 @@ fn parse_ssh_args(args: &[String]) -> Result<CliArgs, String> {
             vsmart,
             vpn,
             discover,
+            full_omp,
             flow,
             timeout_secs,
             debug,
@@ -427,6 +433,7 @@ fn main() {
             vsmart,
             vpn,
             discover,
+            full_omp,
             flow,
             timeout_secs,
             debug,
@@ -465,6 +472,8 @@ fn main() {
                 vpn_id: vpn,
                 peer: cli.peer.as_deref(),
                 discover: *discover,
+                full_omp: *full_omp,
+                all_tunnels: cli.all_tunnels,
                 flow_spec: flow.as_deref(),
                 timeout_secs: *timeout_secs,
                 debug: *debug,
@@ -577,6 +586,7 @@ mod tests {
             "--peer",
             "10.255.1.1",
             "--discover",
+            "--full-omp",
             "--all-tunnels",
             "--timeout",
             "180",
@@ -599,6 +609,7 @@ mod tests {
                 ask_pass,
                 vpn,
                 discover,
+                full_omp,
                 timeout_secs,
                 debug,
                 ..
@@ -609,6 +620,7 @@ mod tests {
                 assert!(ask_pass);
                 assert_eq!(vpn, "10");
                 assert!(discover);
+                assert!(full_omp);
                 assert_eq!(timeout_secs, 180);
                 assert!(debug);
             }

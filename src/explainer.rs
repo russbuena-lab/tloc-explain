@@ -214,6 +214,7 @@ fn resolve_local_egress<'a>(
 pub fn explain_snapshot(mut snapshot: RouterSnapshot) -> AnalysisReport {
     let all_remote_tlocs = snapshot.remote_tlocs.clone();
     let all_tunnels = snapshot.tunnels.clone();
+    let all_omp_routes = snapshot.omp_routes.clone();
 
     if let Some(filter) = snapshot.peer_filter.clone() {
         let target_sys = snapshot
@@ -613,9 +614,19 @@ pub fn explain_snapshot(mut snapshot: RouterSnapshot) -> AnalysisReport {
     });
 
     let findings = collect_drift_findings(&snapshot, &tunnel_verdicts);
+    let quad_zero = build_quad_zero_verdict(
+        &snapshot,
+        &all_omp_routes,
+        &all_remote_tlocs,
+        &all_tunnels,
+        best_local_tloc.as_ref(),
+        &tunnel_verdicts,
+        is_vsmart_mode,
+    );
 
     AnalysisReport {
         snapshot,
+        quad_zero,
         active_primary_tunnels,
         peer_summaries,
         tunnel_verdicts,
@@ -805,10 +816,409 @@ fn lookup_tloc_pref(
         .map(|t| t.preference)
 }
 
+fn build_quad_zero_verdict(
+    snapshot: &RouterSnapshot,
+    all_omp_routes: &[crate::models::OmpRouteEntry],
+    all_remote_tlocs: &[TlocEntry],
+    all_tunnels: &[crate::models::TunnelDiag],
+    best_local_tloc: Option<&TlocEntry>,
+    tunnel_verdicts: &[TunnelVerdict],
+    is_vsmart_mode: bool,
+) -> Option<crate::models::QuadZeroVerdict> {
+    let mut target_vpn = snapshot
+        .target_vpn
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
+        .to_string();
+
+    let all_q0: Vec<&crate::models::OmpRouteEntry> = all_omp_routes
+        .iter()
+        .filter(|r| {
+            (r.prefix == "0.0.0.0/0" || r.prefix == "0.0.0.0")
+                && !r.is_redistributed
+                && r.from_peer != "0.0.0.0"
+        })
+        .collect();
+
+    if target_vpn.is_empty() {
+        target_vpn = all_q0
+            .iter()
+            .find(|r| r.is_chosen_installed || (is_vsmart_mode && is_route_chosen_resolved(&r.status)))
+            .or_else(|| all_q0.first())
+            .map(|r| r.vpn_id.clone())
+            .or_else(|| snapshot.discovered_vpns.first().cloned())
+            .unwrap_or_default();
+    }
+
+    let scoped_q0: Vec<&crate::models::OmpRouteEntry> = all_q0
+        .iter()
+        .copied()
+        .filter(|r| target_vpn.is_empty() || r.vpn_id == target_vpn)
+        .collect();
+
+    let winning_route = scoped_q0
+        .iter()
+        .copied()
+        .find(|r| r.is_chosen_installed || (is_vsmart_mode && is_route_chosen_resolved(&r.status)))
+        .or_else(|| scoped_q0.first().copied());
+
+    let mut winner_system_ip = winning_route
+        .map(|r| r.originator.trim().to_string())
+        .filter(|ip| !ip.is_empty() && ip != "0.0.0.0")
+        .unwrap_or_default();
+
+    let matching_hop = if !winner_system_ip.is_empty() {
+        snapshot
+            .service_paths
+            .iter()
+            .find(|h| h.remote_system_ip == winner_system_ip)
+            .or_else(|| snapshot.service_paths.first())
+    } else {
+        snapshot.service_paths.first()
+    };
+
+    if winner_system_ip.is_empty() {
+        if let Some(hop) = matching_hop {
+            winner_system_ip = hop.remote_system_ip.clone();
+        }
+    }
+
+    if winner_system_ip.is_empty() {
+        return None;
+    }
+
+    let (local_color, local_ip, remote_color, remote_ip, via_service_path) =
+        if let Some(hop) = matching_hop {
+            (
+                hop.local_color.clone(),
+                hop.local_ip.clone(),
+                hop.remote_color.clone(),
+                hop.remote_ip.clone(),
+                true,
+            )
+        } else {
+            let best_tv = tunnel_verdicts
+                .iter()
+                .filter(|tv| tv.remote_system_ip == winner_system_ip)
+                .max_by_key(|tv| {
+                    (
+                        u8::from(tv.verdict == VerdictKind::ActivePrimary),
+                        u8::from(tv.bfd_state == "up"),
+                        tv.recent_tx_data_pkts + tv.recent_rx_data_pkts,
+                        tv.est_cum_data_pkts,
+                    )
+                });
+            if let Some(tv) = best_tv {
+                (
+                    tv.local_color.clone(),
+                    tv.local_ip.clone(),
+                    tv.remote_color.clone(),
+                    tv.remote_ip.clone(),
+                    false,
+                )
+            } else {
+                let best_td = all_tunnels
+                    .iter()
+                    .filter(|td| td.remote_system_ip == winner_system_ip)
+                    .max_by_key(|td| {
+                        (
+                            u8::from(td.bfd_state == "up"),
+                            td.recent_tx_data_pkts + td.recent_rx_data_pkts,
+                            lookup_tloc_pref(&snapshot.local_tlocs, None, &td.local_color, &td.local_ip)
+                                .unwrap_or(0),
+                            td.est_cum_data_pkts,
+                        )
+                    });
+                if let Some(td) = best_td {
+                    (
+                        td.local_color.clone(),
+                        td.local_ip.clone(),
+                        td.remote_color.clone(),
+                        td.remote_ip.clone(),
+                        false,
+                    )
+                } else {
+                    let route_color = winning_route.map(|r| r.color.as_str()).unwrap_or("");
+                    let (lc, lip, _) = resolve_local_egress(
+                        all_tunnels,
+                        &snapshot.local_tlocs,
+                        best_local_tloc,
+                        &winner_system_ip,
+                        route_color,
+                    );
+                    (
+                        lc,
+                        lip,
+                        if route_color.is_empty() || route_color == "rib" {
+                            "unknown".to_string()
+                        } else {
+                            route_color.to_string()
+                        },
+                        String::new(),
+                        false,
+                    )
+                }
+            }
+        };
+
+    let winner_site_id = all_tunnels
+        .iter()
+        .find(|t| t.remote_system_ip == winner_system_ip && !t.remote_site_id.is_empty())
+        .map(|t| t.remote_site_id.clone())
+        .or_else(|| {
+            all_remote_tlocs
+                .iter()
+                .find(|rt| rt.system_ip == winner_system_ip && !rt.site_id.is_empty())
+                .map(|rt| rt.site_id.clone())
+        })
+        .unwrap_or_default();
+
+    let local_tloc_match = snapshot.local_tlocs.iter().find(|lt| {
+        (!local_color.is_empty() && lt.color == local_color)
+            || (!local_ip.is_empty()
+                && (lt.public_ip == local_ip || lt.private_ip == local_ip))
+    });
+    let local_pref = local_tloc_match.map(|lt| lt.preference);
+    let local_interface = local_tloc_match
+        .and_then(|lt| lt.interface.clone())
+        .unwrap_or_default();
+    let remote_pref =
+        lookup_tloc_pref(all_remote_tlocs, Some(&winner_system_ip), &remote_color, &remote_ip);
+
+    let mut reasons = Vec::new();
+    let vpn_label = if target_vpn.is_empty() {
+        "default".to_string()
+    } else {
+        format!("VPN {target_vpn}")
+    };
+
+    if via_service_path && snapshot.service_paths.len() > 1 {
+        let hop_colors: Vec<String> = snapshot
+            .service_paths
+            .iter()
+            .map(|h| format!("{}->{}", h.local_color, h.remote_color))
+            .collect();
+        reasons.push(format!(
+            "{vpn_label} RIB installs 0.0.0.0/0 via {winner_system_ip}; QFP service-path shows {} ECMP IPsec hops ({})",
+            snapshot.service_paths.len(),
+            hop_colors.join(", ")
+        ));
+    } else if via_service_path {
+        reasons.push(format!(
+            "{vpn_label} RIB installs 0.0.0.0/0 via {winner_system_ip}, and QFP hardware service-path selects IPsec {local_color} -> {remote_color}"
+        ));
+    } else {
+        reasons.push(format!(
+            "{vpn_label} selects peer {winner_system_ip} for 0.0.0.0/0 via {local_color} -> {remote_color}"
+        ));
+    }
+
+    if let Some(lp) = local_pref {
+        let iface_prefix = if local_interface.is_empty() {
+            String::new()
+        } else {
+            format!("{local_interface} ")
+        };
+        let others: Vec<&TlocEntry> = snapshot
+            .local_tlocs
+            .iter()
+            .filter(|lt| lt.color != local_color)
+            .collect();
+        let higher: Vec<String> = others
+            .iter()
+            .filter(|lt| lt.preference > lp)
+            .map(|lt| format!("{} Pref={}", lt.color, lt.preference))
+            .collect();
+        let tied: Vec<String> = others
+            .iter()
+            .filter(|lt| lt.preference == lp)
+            .map(|lt| lt.color.clone())
+            .collect();
+        let lower: Vec<String> = others
+            .iter()
+            .filter(|lt| lt.preference < lp)
+            .map(|lt| format!("{} Pref={}", lt.color, lt.preference))
+            .collect();
+
+        if !higher.is_empty() {
+            reasons.push(format!(
+                "local {iface_prefix}({local_color}) Pref={lp} is active because higher-preference transport ({}) is down, restricted, or deprioritized by policy",
+                higher.join(", ")
+            ));
+        } else if !lower.is_empty() && tied.is_empty() {
+            reasons.push(format!(
+                "local {iface_prefix}({local_color}) has highest TLOC Pref={lp} (beating {})",
+                lower.join(", ")
+            ));
+        } else if !tied.is_empty() {
+            reasons.push(format!(
+                "local {iface_prefix}({local_color}) shares TLOC Pref={lp} with {} (ECMP-eligible)",
+                tied.join(", ")
+            ));
+        } else {
+            reasons.push(format!("local {iface_prefix}({local_color}) TLOC Pref={lp}"));
+        }
+    }
+
+    if let Some(rp) = remote_pref {
+        reasons.push(format!("remote {remote_color} TLOC Pref={rp}"));
+    }
+
+    if let Some(tv) = tunnel_verdicts.iter().find(|tv| {
+        tv.remote_system_ip == winner_system_ip
+            && (local_color.is_empty() || tv.local_color == local_color)
+            && (remote_color.is_empty() || remote_color == "unknown" || tv.remote_color == remote_color)
+    }) {
+        let mut health = format!("BFD {}", tv.bfd_state);
+        if tv.detect_multiplier > 0 {
+            health.push_str(&format!(" mult={}", tv.detect_multiplier));
+        }
+        if tv.mean_latency_ms > 0 {
+            health.push_str(&format!(", {}ms latency", tv.mean_latency_ms));
+        }
+        let recent = tv.recent_tx_data_pkts + tv.recent_rx_data_pkts;
+        if recent > 0 {
+            health.push_str(&format!(
+                ", carrying {}/{} recent TX/RX data pkts",
+                tv.recent_tx_data_pkts, tv.recent_rx_data_pkts
+            ));
+        } else if tv.est_cum_data_pkts > 0 {
+            health.push_str(&format!(
+                ", ~{} est. cumulative data pkts",
+                tv.est_cum_data_pkts
+            ));
+        }
+        reasons.push(health);
+    }
+
+    let standby_peers: BTreeSet<String> = scoped_q0
+        .iter()
+        .map(|r| r.originator.trim())
+        .filter(|ip| !ip.is_empty() && *ip != winner_system_ip && *ip != "0.0.0.0")
+        .map(ToString::to_string)
+        .collect();
+    if !standby_peers.is_empty() {
+        let peers_list: Vec<String> = standby_peers.into_iter().collect();
+        reasons.push(format!("standby 0.0.0.0/0 peer(s): {}", peers_list.join(", ")));
+    }
+
+    Some(crate::models::QuadZeroVerdict {
+        target_vpn,
+        winner_system_ip,
+        winner_site_id,
+        local_color,
+        local_ip,
+        local_interface,
+        local_pref,
+        remote_color,
+        remote_ip,
+        remote_pref,
+        via_service_path,
+        why: reasons.join("; "),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parsers::build_snapshot_from_text;
+    use crate::parsers::{
+        build_snapshot_from_text, expand_iosxe_interface_name, parse_ip_route_quad_zero,
+        parse_service_path_output, resolve_vrf_lan_interface_and_ip,
+    };
+
+    #[test]
+    fn parses_rib_quad_zero_and_qfp_service_path_without_omp_routes() {
+        let raw = r#"
+site101-kit1# show sdwan system status
+System IP:              10.101.1.1
+Site ID:                101
+host-name               site101-kit1
+site101-kit1# show vrf
+  Name                             Default RD            Protocols   Interfaces
+  1000                             <not set>             ipv4        Gi3
+  Mgmt-intf                        <not set>             ipv4,ipv6   Gi4
+site101-kit1# show ip interface brief
+Interface              IP-Address      OK? Method Status                Protocol
+GigabitEthernet1       10.10.1.21      YES other  up                    up
+GigabitEthernet2       172.16.10.21    YES other  up                    up
+GigabitEthernet3       10.101.1.1      YES other  up                    up
+site101-kit1# show sdwan running-config sdwan
+sdwan
+ interface GigabitEthernet1
+  tunnel-interface
+   encapsulation ipsec preference 200 weight 1
+   color biz-internet
+  exit
+ exit
+ interface GigabitEthernet2
+  tunnel-interface
+   encapsulation ipsec preference 100 weight 1
+   color public-internet
+  exit
+ exit
+!
+site101-kit1# show ip route vrf 1000 0.0.0.0 0.0.0.0
+Routing Table: 1000
+Routing entry for 0.0.0.0/0, supernet
+  Known via "omp", distance 251, metric 0, type intra area
+  Last update from 10.255.1.1 on Sdwan-system-intf, 1w2d ago
+  Routing Descriptor Blocks:
+  * 10.255.1.1 (default), from 10.255.1.1, 1w2d ago, via Sdwan-system-intf
+site101-kit1# show sdwan policy service-path vpn 1000 interface GigabitEthernet3 source-ip 10.101.1.1 dest-ip 8.8.8.8 protocol 6 all
+Number of possible next hops: 1
+Next Hop: IPsec
+  Source: 10.10.1.21 12366 Destination: 172.16.1.21 12346 Local Color: biz-internet Remote Color: biz-internet Remote System IP: 10.255.1.1
+site101-kit1# show sdwan bfd sessions
+                                      SOURCE TLOC      REMOTE TLOC                                                      DETECT
+SYSTEM IP        SITE ID  STATE       COLOR            COLOR            SOURCE IP        DST PUBLIC IP    DST PORT ENCAP MULTIPLIER TX INT UPTIME          TRANSITIONS
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+10.255.1.1       1        up          biz-internet     biz-internet     10.10.1.21       172.16.1.21      12346    ipsec 7          1000   1w2d:00:00:00   0
+10.255.1.1       1        up          public-internet  public-internet  172.16.10.21     172.16.1.22      12346    ipsec 7          1000   1w2d:00:00:00   0
+site101-kit1# show sdwan app-route stats remote-system-ip 10.255.1.1
+app-route stats 10.10.1.21 172.16.1.21
+ remote-system-ip 10.255.1.1
+ local-color biz-internet
+ remote-color biz-internet
+ mean-loss 0
+ mean-latency 12
+ mean-jitter 1
+ tx-pkts 420
+ rx-pkts 410
+ site-id 1
+ sla-class-index 1
+"#;
+        assert_eq!(expand_iosxe_interface_name("Gi3"), "GigabitEthernet3");
+        assert_eq!(
+            resolve_vrf_lan_interface_and_ip(raw, "1000"),
+            Some(("GigabitEthernet3".to_string(), "10.101.1.1".to_string()))
+        );
+        let rib_q0 = parse_ip_route_quad_zero(raw, "1000");
+        assert_eq!(rib_q0.len(), 1);
+        assert_eq!(rib_q0[0].originator, "10.255.1.1");
+        assert!(rib_q0[0].is_chosen_installed);
+
+        let hops = parse_service_path_output(raw);
+        assert_eq!(hops.len(), 1);
+        assert_eq!(hops[0].local_color, "biz-internet");
+        assert_eq!(hops[0].remote_color, "biz-internet");
+        assert_eq!(hops[0].remote_system_ip, "10.255.1.1");
+
+        let mut snap = build_snapshot_from_text("site101-kit1", "10.101.1.1", "101", "test", raw);
+        snap.target_vpn = Some("1000".to_string());
+        let report = explain_snapshot(snap);
+        let q0 = report.quad_zero.expect("quad_zero verdict must be present");
+        assert_eq!(q0.target_vpn, "1000");
+        assert_eq!(q0.winner_system_ip, "10.255.1.1");
+        assert_eq!(q0.winner_site_id, "1");
+        assert_eq!(q0.local_color, "biz-internet");
+        assert_eq!(q0.remote_color, "biz-internet");
+        assert_eq!(q0.local_pref, Some(200));
+        assert!(q0.via_service_path);
+        assert!(q0.why.contains("Pref=200"));
+        assert!(q0.why.contains("10.255.1.1"));
+    }
 
     const SAMPLE_CAPTURE: &str = r#"
 site101-kit1# show sdwan running-config sdwan

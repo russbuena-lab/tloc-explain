@@ -11,7 +11,8 @@ use regex::Regex;
 
 use crate::models::{runtime_scratch_dir, utc_now_rfc3339, RouterSnapshot};
 use crate::parsers::{
-    build_snapshot_from_text, parse_bfd_sessions, parse_omp_routes, parse_omp_tlocs,
+    build_snapshot_from_text, parse_bfd_sessions, parse_ip_route_quad_zero, parse_omp_routes,
+    parse_omp_tlocs, parse_service_path_output, parse_vrfs, resolve_vrf_lan_interface_and_ip,
     sort_unique_vpns,
 };
 
@@ -187,9 +188,80 @@ pub struct SshTarget<'a> {
     pub vpn_id: &'a str,
     pub peer: Option<&'a str>,
     pub discover: bool,
+    pub full_omp: bool,
+    pub all_tunnels: bool,
     pub flow_spec: Option<&'a str>,
     pub timeout_secs: u64,
     pub debug: bool,
+}
+
+enum SshStep {
+    Static(String),
+    Dynamic(fn(&SshTarget<'_>, &str) -> Option<String>),
+}
+
+fn resolve_session_vpn(target: &SshTarget<'_>, raw_so_far: &str) -> Option<String> {
+    if !target.vpn_id.is_empty()
+        && !target.vpn_id.eq_ignore_ascii_case("all")
+        && !target.vpn_id.eq_ignore_ascii_case("auto")
+    {
+        return Some(target.vpn_id.to_string());
+    }
+    parse_vrfs(raw_so_far).into_iter().next()
+}
+
+fn build_ip_route_quad_zero_cmd(target: &SshTarget<'_>, raw_so_far: &str) -> Option<String> {
+    let vpn = resolve_session_vpn(target, raw_so_far)?;
+    Some(format!("show ip route vrf {vpn} 0.0.0.0 0.0.0.0"))
+}
+
+fn build_service_path_cmd(target: &SshTarget<'_>, raw_so_far: &str) -> Option<String> {
+    let vpn = resolve_session_vpn(target, raw_so_far)?;
+    let (iface, ip) = resolve_vrf_lan_interface_and_ip(raw_so_far, &vpn)?;
+    Some(format!(
+        "show sdwan policy service-path vpn {vpn} interface {iface} source-ip {ip} dest-ip 8.8.8.8 protocol 6 all"
+    ))
+}
+
+fn build_omp_routes_cmd(target: &SshTarget<'_>, raw_so_far: &str) -> Option<String> {
+    if let Some(vpn) = resolve_session_vpn(target, raw_so_far) {
+        if !target.vpn_id.is_empty()
+            && !target.vpn_id.eq_ignore_ascii_case("all")
+            && !target.vpn_id.eq_ignore_ascii_case("auto")
+        {
+            return Some(format!("show sdwan omp routes vpn {vpn}"));
+        }
+    }
+    Some("show sdwan omp routes".to_string())
+}
+
+fn detect_quad_zero_winner_in_session(raw_so_far: &str) -> Option<String> {
+    if let Some(sys_ip) = parse_service_path_output(raw_so_far)
+        .into_iter()
+        .find(|h| !h.remote_system_ip.is_empty())
+        .map(|h| h.remote_system_ip)
+    {
+        return Some(sys_ip);
+    }
+    parse_ip_route_quad_zero(raw_so_far, "")
+        .into_iter()
+        .find(|r| r.is_chosen_installed && !r.originator.is_empty())
+        .map(|r| r.originator)
+}
+
+fn build_app_route_cmd(target: &SshTarget<'_>, raw_so_far: &str) -> Option<String> {
+    if let Some(peer_arg) = target.peer {
+        if let Some(sys_ip) = resolve_peer_system_ip_in_session(raw_so_far, peer_arg) {
+            return Some(format!("show sdwan app-route stats remote-system-ip {sys_ip}"));
+        }
+    } else if !target.all_tunnels {
+        if let Some(winner_sys) = detect_quad_zero_winner_in_session(raw_so_far) {
+            return Some(format!(
+                "show sdwan app-route stats remote-system-ip {winner_sys}"
+            ));
+        }
+    }
+    Some("show sdwan app-route stats".to_string())
 }
 
 fn resolve_peer_system_ip_in_session(raw_so_far: &str, peer_arg: &str) -> Option<String> {
@@ -216,11 +288,11 @@ fn resolve_peer_system_ip_in_session(raw_so_far: &str, peer_arg: &str) -> Option
     Some(trimmed.to_string())
 }
 
-/// Runs a batch of read-only CLI commands over native OpenSSH with continuous pipe draining,
-/// prompt-synchronized stepping, `--More--` handling, and diagnostic logging.
-pub fn run_ssh_commands(target: &SshTarget<'_>, commands: &[String]) -> Result<String, String> {
-    for c in commands {
-        validate_readonly_cli_command(c)?;
+fn run_ssh_steps(target: &SshTarget<'_>, steps: &[SshStep]) -> Result<String, String> {
+    for step in steps {
+        if let SshStep::Static(c) = step {
+            validate_readonly_cli_command(c)?;
+        }
     }
 
     let log_path = runtime_scratch_dir().join("tloc-explain-debug.log");
@@ -390,31 +462,40 @@ pub fn run_ssh_commands(target: &SshTarget<'_>, commands: &[String]) -> Result<S
         timed_out = true;
         timed_out_cmd = "SSH handshake / initial prompt".to_string();
     } else if prompt_mode {
-        for (idx, cmd_str) in commands.iter().enumerate() {
+        for (idx, step) in steps.iter().enumerate() {
             if Instant::now() >= total_deadline {
                 timed_out = true;
-                timed_out_cmd = cmd_str.clone();
+                timed_out_cmd = format!("step {}/{}", idx + 1, steps.len());
                 break;
             }
 
-            let actual_cmd = if cmd_str == "show sdwan app-route stats" {
-                if let Some(peer_arg) = target.peer {
+            let actual_cmd = match step {
+                SshStep::Static(c) => c.clone(),
+                SshStep::Dynamic(builder) => {
                     let snapshot_so_far = stdout_buf.lock().map(|g| g.clone()).unwrap_or_default();
-                    if let Some(sys_ip) = resolve_peer_system_ip_in_session(&snapshot_so_far, peer_arg) {
-                        let narrowed = format!("show sdwan app-route stats remote-system-ip {sys_ip}");
-                        validate_readonly_cli_command(&narrowed)?;
-                        narrowed
-                    } else {
-                        cmd_str.clone()
+                    match builder(target, &snapshot_so_far) {
+                        Some(c) => {
+                            validate_readonly_cli_command(&c)?;
+                            c
+                        }
+                        None => {
+                            let skip_msg = format!(
+                                "[+{:.2}s] step [{}/{}] skipped (prerequisites absent)",
+                                session_start.elapsed().as_secs_f64(),
+                                idx + 1,
+                                steps.len()
+                            );
+                            log_lines.push(skip_msg.clone());
+                            if target.debug {
+                                eprintln!("  {skip_msg}");
+                            }
+                            continue;
+                        }
                     }
-                } else {
-                    cmd_str.clone()
                 }
-            } else {
-                cmd_str.clone()
             };
 
-            eprintln!("[{}/{}] {} ...", idx + 1, commands.len(), actual_cmd);
+            eprintln!("[{}/{}] {} ...", idx + 1, steps.len(), actual_cmd);
             let cmd_t0 = Instant::now();
             let start_len = stdout_buf.lock().map(|g| g.len()).unwrap_or(0);
             last_more_len = start_len;
@@ -467,7 +548,7 @@ pub fn run_ssh_commands(target: &SshTarget<'_>, commands: &[String]) -> Result<S
                         "[+{:.2}s] step [{}/{}] '{}' done ({elapsed:.2}s, {delta}B)",
                         session_start.elapsed().as_secs_f64(),
                         idx + 1,
-                        commands.len(),
+                        steps.len(),
                         actual_cmd
                     );
                     log_lines.push(msg.clone());
@@ -506,13 +587,17 @@ pub fn run_ssh_commands(target: &SshTarget<'_>, commands: &[String]) -> Result<S
             }
         }
     } else {
-        // Non-interactive shell mode (e.g. Viptela vSmart with ssh -T): pipeline commands while
+        // Non-interactive shell mode (e.g. Viptela vSmart with ssh -T): pipeline static steps while
         // continuously draining pipes in reader threads.
-        for (idx, cmd_str) in commands.iter().enumerate() {
-            if target.debug {
-                eprintln!("[{}/{}] {} (batch) ...", idx + 1, commands.len(), cmd_str);
+        let mut static_count = 0usize;
+        for (idx, step) in steps.iter().enumerate() {
+            if let SshStep::Static(cmd_str) = step {
+                static_count += 1;
+                if target.debug {
+                    eprintln!("[{}/{}] {} (batch) ...", idx + 1, steps.len(), cmd_str);
+                }
+                let _ = child_stdin.write_all(format!("{cmd_str}\n").as_bytes());
             }
-            let _ = child_stdin.write_all(format!("{cmd_str}\n").as_bytes());
         }
         let _ = child_stdin.write_all(b"exit\n");
         let _ = child_stdin.flush();
@@ -522,7 +607,7 @@ pub fn run_ssh_commands(target: &SshTarget<'_>, commands: &[String]) -> Result<S
             match child.try_wait() {
                 Ok(Some(st)) => {
                     exit_status = Some(st);
-                    completed_cmds = commands.len();
+                    completed_cmds = static_count;
                     break;
                 }
                 Ok(None) => {
@@ -569,6 +654,8 @@ pub fn run_ssh_commands(target: &SshTarget<'_>, commands: &[String]) -> Result<S
 
     let has_usable_telemetry = !stdout.trim().is_empty()
         && (completed_cmds > 1
+            || stdout.contains("Routing Table:")
+            || stdout.contains("Next Hop:")
             || stdout.contains("tloc entries for ")
             || stdout.contains("tunnel stats ")
             || stdout.contains("app-route statistics ")
@@ -615,64 +702,64 @@ pub fn run_ssh_commands(target: &SshTarget<'_>, commands: &[String]) -> Result<S
 
 /// Collects a full `RouterSnapshot` from either an IOS-XE `cEdge` router or a `vSmart` controller over SSH.
 pub fn collect_via_ssh(target: &SshTarget<'_>) -> Result<RouterSnapshot, String> {
-    let all_vpns = target.vpn_id.is_empty() || target.vpn_id.eq_ignore_ascii_case("all");
-    let routes_cmd_edge = if all_vpns {
-        "show sdwan omp routes".to_string()
-    } else {
-        format!("show sdwan omp routes vpn {}", target.vpn_id)
-    };
+    let all_vpns = target.vpn_id.is_empty()
+        || target.vpn_id.eq_ignore_ascii_case("all")
+        || target.vpn_id.eq_ignore_ascii_case("auto");
     let routes_cmd_vsmart = if all_vpns {
         "show omp routes".to_string()
     } else {
         format!("show omp routes vpn {}", target.vpn_id)
     };
 
-    let mut cmds: Vec<String> = if target.is_vsmart {
+    let mut steps: Vec<SshStep> = if target.is_vsmart {
         if target.discover {
-            vec!["paginate false".to_string(), "show omp tlocs".to_string(), routes_cmd_vsmart]
+            vec![
+                SshStep::Static("paginate false".to_string()),
+                SshStep::Static("show omp tlocs".to_string()),
+                SshStep::Static(routes_cmd_vsmart),
+            ]
         } else {
             vec![
-                "paginate false".to_string(),
-                "show omp tlocs".to_string(),
-                routes_cmd_vsmart,
-                "show running-config apply-policy".to_string(),
+                SshStep::Static("paginate false".to_string()),
+                SshStep::Static("show omp tlocs".to_string()),
+                SshStep::Static(routes_cmd_vsmart),
+                SshStep::Static("show running-config apply-policy".to_string()),
             ]
         }
-    } else if target.discover {
-        vec![
-            "terminal length 0".to_string(),
-            "show vrf".to_string(),
-            "show sdwan control local-properties".to_string(),
-            "show sdwan running-config sdwan".to_string(),
-            "show sdwan bfd sessions".to_string(),
-            routes_cmd_edge,
-            "show sdwan tunnel statistics".to_string(),
-        ]
     } else {
-        vec![
-            "terminal length 0".to_string(),
-            "show vrf".to_string(),
-            "show sdwan control local-properties".to_string(),
-            "show sdwan running-config sdwan".to_string(),
-            "show sdwan bfd sessions".to_string(),
-            "show sdwan omp tlocs".to_string(),
-            routes_cmd_edge,
-            "show sdwan tunnel statistics".to_string(),
-            "show sdwan app-route stats".to_string(),
-        ]
+        let mut s = vec![
+            SshStep::Static("terminal length 0".to_string()),
+            SshStep::Static("show vrf".to_string()),
+            SshStep::Static("show ip interface brief".to_string()),
+            SshStep::Static("show sdwan control local-properties".to_string()),
+            SshStep::Static("show sdwan running-config sdwan".to_string()),
+            SshStep::Dynamic(build_ip_route_quad_zero_cmd),
+            SshStep::Dynamic(build_service_path_cmd),
+            SshStep::Static("show sdwan bfd sessions".to_string()),
+        ];
+        if target.full_omp {
+            s.push(SshStep::Static("show sdwan omp tlocs".to_string()));
+            s.push(SshStep::Dynamic(build_omp_routes_cmd));
+        }
+        s.push(SshStep::Static("show sdwan tunnel statistics".to_string()));
+        if !target.discover {
+            s.push(SshStep::Dynamic(build_app_route_cmd));
+        }
+        s
     };
 
     if let Some(flow) = target.flow_spec {
-        cmds.push(flow.to_string());
+        steps.push(SshStep::Static(flow.to_string()));
     }
 
-    let raw = run_ssh_commands(target, &cmds)?;
+    let raw = run_ssh_steps(target, &steps)?;
 
     if target.is_vsmart {
         let tlocs = parse_omp_tlocs(&raw);
         let routes = parse_omp_routes(&raw);
         let mut snap = build_snapshot_from_text("vsmart", target.host, "100", "ssh-vsmart", &raw);
         snap.discovered_vpns = sort_unique_vpns(routes.iter().map(|r| r.vpn_id.as_str()));
+        snap.target_vpn = resolve_session_vpn(target, &raw).or_else(|| snap.discovered_vpns.first().cloned());
         snap.peer_filter = target.peer.map(String::from);
         snap.remote_tlocs = tlocs;
         snap.omp_routes = routes;
@@ -685,7 +772,29 @@ pub fn collect_via_ssh(target: &SshTarget<'_>) -> Result<RouterSnapshot, String>
     let (sys_ip, site_id, host_name) = extract_system_identity(&raw, target.host);
     let mode_label = if target.discover { "ssh-discover" } else { "ssh" };
     let mut snap = build_snapshot_from_text(&host_name, &sys_ip, &site_id, mode_label, &raw);
-    snap.peer_filter = target.peer.map(String::from);
+    if let Some(vpn) = resolve_session_vpn(target, &raw) {
+        snap.target_vpn = Some(vpn);
+    }
+
+    if let Some(p) = target.peer {
+        snap.peer_filter = Some(p.to_string());
+    } else if !target.discover && !target.all_tunnels {
+        if let Some(winner_sys) = snap
+            .service_paths
+            .iter()
+            .find(|h| !h.remote_system_ip.is_empty())
+            .map(|h| h.remote_system_ip.clone())
+            .or_else(|| {
+                snap.omp_routes
+                    .iter()
+                    .find(|r| r.prefix == "0.0.0.0/0" && r.is_chosen_installed && !r.originator.is_empty())
+                    .map(|r| r.originator.clone())
+            })
+        {
+            snap.peer_filter = Some(winner_sys);
+        }
+    }
+
     Ok(snap)
 }
 
