@@ -1,13 +1,15 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 
-use crate::models::{runtime_scratch_dir, RouterSnapshot};
+use crate::models::{runtime_scratch_dir, utc_now_rfc3339, RouterSnapshot};
 use crate::parsers::{build_snapshot_from_text, parse_omp_routes, parse_omp_tlocs};
 
 /// Validates that every CLI command sent over SSH is strictly read-only.
@@ -127,109 +129,48 @@ pub fn prompt_password_hidden(prompt: &str) -> Result<String, String> {
     Ok(line.trim_end_matches(&['\r', '\n'][..]).to_string())
 }
 
-/// Runs a batch of read-only CLI commands over native OpenSSH in a single session and returns raw stdout.
-pub fn run_ssh_commands(
-    host: &str,
-    user: &str,
-    port: u16,
-    identity_file: Option<&str>,
-    password: Option<&str>,
-    commands: &[String],
-    timeout_secs: u64,
-) -> Result<String, String> {
-    for c in commands {
-        validate_readonly_cli_command(c)?;
+fn looks_like_prompt_tail(buf: &str) -> bool {
+    let after_nl = match buf.rfind('\n') {
+        Some(idx) => &buf[idx + 1..],
+        None => buf,
+    };
+    let line = after_nl.trim_end_matches(&['\r', ' '][..]);
+    if line.len() < 2 || line.len() > 64 {
+        return false;
     }
-
-    let _guard: Option<AskpassGuard>;
-    let mut cmd = Command::new("/usr/bin/ssh");
-    cmd.arg("-T")
-        .arg("-p")
-        .arg(port.to_string())
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("LogLevel=ERROR")
-        .arg("-o")
-        .arg("ConnectTimeout=8");
-
-    if let Some(key) = identity_file.filter(|s| !s.is_empty()) {
-        cmd.arg("-i")
-            .arg(key)
-            .arg("-o")
-            .arg("IdentitiesOnly=yes");
+    if !(line.ends_with('#') || line.ends_with('>')) {
+        return false;
     }
-
-    if let Some(pw) = password.filter(|s| !s.is_empty()) {
-        let guard = AskpassGuard::create()?;
-        if identity_file.is_none() {
-            cmd.arg("-o").arg("PubkeyAuthentication=no");
-        }
-        cmd.arg("-o")
-            .arg("NumberOfPasswordPrompts=1")
-            .env("SSH_ASKPASS", &guard.path)
-            .env("SSH_ASKPASS_REQUIRE", "force")
-            .env("DISPLAY", "tloc-explain:0")
-            .env("TLOC_SSH_PASS", pw);
-        _guard = Some(guard);
-    } else {
-        cmd.arg("-o").arg("BatchMode=yes");
-        _guard = None;
+    if line.contains("##") || line.contains(">>") || line.contains(' ') {
+        return false;
     }
+    let host_part = &line[..line.len() - 1];
+    !host_part.is_empty()
+        && host_part.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b'/' | b'(' | b')')
+        })
+}
 
-    cmd.arg(format!("{}@{}", user, host))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+fn tail_has_more_prompt(buf: &str) -> bool {
+    let after_nl = match buf.rfind('\n') {
+        Some(idx) => &buf[idx + 1..],
+        None => buf,
+    };
+    after_nl.to_ascii_lowercase().contains("--more--")
+}
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed launching /usr/bin/ssh to {}: {e}", host))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        for c in commands {
-            stdin
-                .write_all(format!("{c}\n").as_bytes())
-                .map_err(|e| format!("Failed writing CLI command to SSH stdin: {e}"))?;
-        }
-        let _ = stdin.write_all(b"exit\n");
-    }
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("SSH session to {} timed out after {}s", host, timeout_secs));
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => return Err(format!("SSH wait error: {e}")),
+fn write_debug_log(path: &Path, lines: &[String]) {
+    if let Ok(mut f) = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+    {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        for line in lines {
+            let _ = writeln!(f, "{line}");
         }
     }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed collecting SSH output: {e}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if !output.status.success() && stdout.trim().is_empty() {
-        return Err(format!(
-            "SSH to {}@{} failed (exit {:?}): {}",
-            user,
-            host,
-            output.status.code(),
-            stderr.trim()
-        ));
-    }
-
-    Ok(stdout)
 }
 
 /// Connection and query options for collecting read-only SD-WAN telemetry over SSH.
@@ -242,6 +183,388 @@ pub struct SshTarget<'a> {
     pub is_vsmart: bool,
     pub vpn_id: &'a str,
     pub flow_spec: Option<&'a str>,
+    pub timeout_secs: u64,
+    pub debug: bool,
+}
+
+/// Runs a batch of read-only CLI commands over native OpenSSH with continuous pipe draining,
+/// prompt-synchronized stepping, `--More--` handling, and diagnostic logging.
+pub fn run_ssh_commands(target: &SshTarget<'_>, commands: &[String]) -> Result<String, String> {
+    for c in commands {
+        validate_readonly_cli_command(c)?;
+    }
+
+    let log_path = runtime_scratch_dir().join("tloc-explain-debug.log");
+    let mut log_lines = vec![
+        format!("=== tloc-explain SSH diagnostic log ({}) ===", utc_now_rfc3339()),
+        format!(
+            "target={}@{}:{} timeout={}s vsmart={}",
+            target.user, target.host, target.port, target.timeout_secs, target.is_vsmart
+        ),
+    ];
+
+    let _guard: Option<AskpassGuard>;
+    let mut cmd = Command::new("/usr/bin/ssh");
+    cmd.arg("-T")
+        .arg("-p")
+        .arg(target.port.to_string())
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
+        .arg("-o")
+        .arg("ConnectTimeout=8");
+
+    if let Some(key) = target.identity_file.filter(|s| !s.is_empty()) {
+        cmd.arg("-i")
+            .arg(key)
+            .arg("-o")
+            .arg("IdentitiesOnly=yes");
+        log_lines.push(format!("auth=pubkey identity_file={key}"));
+    }
+
+    if let Some(pw) = target.password.filter(|s| !s.is_empty()) {
+        let guard = AskpassGuard::create()?;
+        if target.identity_file.is_none() {
+            cmd.arg("-o").arg("PubkeyAuthentication=no");
+        }
+        cmd.arg("-o")
+            .arg("NumberOfPasswordPrompts=1")
+            .env("SSH_ASKPASS", &guard.path)
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .env("DISPLAY", "tloc-explain:0")
+            .env("TLOC_SSH_PASS", pw);
+        log_lines.push("auth=password_askpass".to_string());
+        _guard = Some(guard);
+    } else {
+        cmd.arg("-o").arg("BatchMode=yes");
+        log_lines.push("auth=batch_mode".to_string());
+        _guard = None;
+    }
+
+    cmd.arg(format!("{}@{}", target.user, target.host))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed launching /usr/bin/ssh to {}: {e}", target.host))?;
+
+    let mut child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Failed capturing SSH stdin pipe".to_string())?;
+    let mut child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed capturing SSH stdout pipe".to_string())?;
+    let mut child_stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed capturing SSH stderr pipe".to_string())?;
+
+    let stdout_buf = Arc::new(Mutex::new(String::new()));
+    let stdout_done = Arc::new(AtomicBool::new(false));
+    let out_ref = Arc::clone(&stdout_buf);
+    let out_done_ref = Arc::clone(&stdout_done);
+    let out_handle = std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = child_stdout.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            let s = String::from_utf8_lossy(&chunk[..n]);
+            if let Ok(mut guard) = out_ref.lock() {
+                guard.push_str(&s);
+            }
+        }
+        out_done_ref.store(true, Ordering::Release);
+    });
+
+    let stderr_buf = Arc::new(Mutex::new(String::new()));
+    let stderr_done = Arc::new(AtomicBool::new(false));
+    let err_ref = Arc::clone(&stderr_buf);
+    let err_done_ref = Arc::clone(&stderr_done);
+    let err_handle = std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = child_stderr.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            let s = String::from_utf8_lossy(&chunk[..n]);
+            if let Ok(mut guard) = err_ref.lock() {
+                guard.push_str(&s);
+            }
+        }
+        err_done_ref.store(true, Ordering::Release);
+    });
+
+    let session_start = Instant::now();
+    let total_deadline = session_start + Duration::from_secs(target.timeout_secs);
+    let mut prompt_mode = false;
+    let mut first_byte_at: Option<Instant> = None;
+    let mut last_more_len = 0usize;
+
+    // Wait for initial prompt (IOS-XE) or initial login banner settlement (Viptela vSmart -T)
+    loop {
+        if Instant::now() >= total_deadline {
+            break;
+        }
+        let (len, has_prompt, has_more) = if let Ok(guard) = stdout_buf.lock() {
+            (
+                guard.len(),
+                looks_like_prompt_tail(&guard),
+                tail_has_more_prompt(&guard),
+            )
+        } else {
+            (0, false, false)
+        };
+
+        if len > 0 && first_byte_at.is_none() {
+            first_byte_at = Some(Instant::now());
+        }
+        if has_more && len > last_more_len {
+            let _ = child_stdin.write_all(b" ");
+            let _ = child_stdin.flush();
+            last_more_len = len;
+        }
+        if has_prompt {
+            prompt_mode = true;
+            break;
+        }
+        if let Some(fb) = first_byte_at {
+            if fb.elapsed() >= Duration::from_millis(900) {
+                // Received initial output (e.g. "Last login: ...") without interactive prompt
+                break;
+            }
+        }
+        if stdout_done.load(Ordering::Acquire) || matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    log_lines.push(format!(
+        "[+{:.2}s] init_settled prompt_mode={prompt_mode}",
+        session_start.elapsed().as_secs_f64()
+    ));
+
+    let mut timed_out = false;
+    let mut timed_out_cmd = String::new();
+    let mut completed_cmds = 0usize;
+    let mut exit_status = None;
+
+    if Instant::now() >= total_deadline && first_byte_at.is_none() {
+        timed_out = true;
+        timed_out_cmd = "SSH handshake / initial prompt".to_string();
+    } else if prompt_mode {
+        for (idx, cmd_str) in commands.iter().enumerate() {
+            if Instant::now() >= total_deadline {
+                timed_out = true;
+                timed_out_cmd = cmd_str.clone();
+                break;
+            }
+
+            eprintln!("[{}/{}] {} ...", idx + 1, commands.len(), cmd_str);
+            let cmd_t0 = Instant::now();
+            let start_len = stdout_buf.lock().map(|g| g.len()).unwrap_or(0);
+            last_more_len = start_len;
+
+            if let Err(e) = child_stdin
+                .write_all(format!("{cmd_str}\n").as_bytes())
+                .and_then(|_| child_stdin.flush())
+            {
+                log_lines.push(format!("[+{:.2}s] stdin write failed on '{}': {e}", session_start.elapsed().as_secs_f64(), cmd_str));
+                break;
+            }
+
+            loop {
+                if Instant::now() >= total_deadline {
+                    timed_out = true;
+                    timed_out_cmd = cmd_str.clone();
+                    break;
+                }
+
+                let (cur_len, prompt_ready, has_more) = if let Ok(guard) = stdout_buf.lock() {
+                    let cur_len = guard.len();
+                    let slice = if cur_len > start_len {
+                        &guard[start_len..]
+                    } else {
+                        ""
+                    };
+                    let has_nl = slice.contains('\n');
+                    let tail_prompt = looks_like_prompt_tail(slice);
+                    let ready = !slice.is_empty()
+                        && tail_prompt
+                        && (has_nl || cmd_t0.elapsed() >= Duration::from_millis(400));
+                    (cur_len, ready, tail_has_more_prompt(slice))
+                } else {
+                    (0, false, false)
+                };
+
+                if has_more && cur_len > last_more_len {
+                    let _ = child_stdin.write_all(b" ");
+                    let _ = child_stdin.flush();
+                    last_more_len = cur_len;
+                    log_lines.push(format!("[+{:.2}s] answered --More-- prompt", session_start.elapsed().as_secs_f64()));
+                }
+
+                if prompt_ready {
+                    completed_cmds += 1;
+                    let end_len = stdout_buf.lock().map(|g| g.len()).unwrap_or(start_len);
+                    let delta = end_len.saturating_sub(start_len);
+                    let elapsed = cmd_t0.elapsed().as_secs_f64();
+                    let msg = format!(
+                        "[+{:.2}s] step [{}/{}] '{}' done ({elapsed:.2}s, {delta}B)",
+                        session_start.elapsed().as_secs_f64(),
+                        idx + 1,
+                        commands.len(),
+                        cmd_str
+                    );
+                    log_lines.push(msg.clone());
+                    if target.debug {
+                        eprintln!("  {msg}");
+                    }
+                    break;
+                }
+
+                if stdout_done.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+
+            if timed_out || stdout_done.load(Ordering::Acquire) {
+                break;
+            }
+        }
+
+        if !timed_out && !stdout_done.load(Ordering::Acquire) {
+            let _ = child_stdin.write_all(b"exit\n");
+            let _ = child_stdin.flush();
+        }
+        drop(child_stdin);
+
+        let exit_wait_end = (Instant::now() + Duration::from_secs(3)).min(total_deadline);
+        while Instant::now() < exit_wait_end {
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    exit_status = Some(st);
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+                Err(_) => break,
+            }
+        }
+    } else {
+        // Non-interactive shell mode (e.g. Viptela vSmart with ssh -T): pipeline commands while
+        // continuously draining pipes in reader threads.
+        for (idx, cmd_str) in commands.iter().enumerate() {
+            if target.debug {
+                eprintln!("[{}/{}] {} (batch) ...", idx + 1, commands.len(), cmd_str);
+            }
+            let _ = child_stdin.write_all(format!("{cmd_str}\n").as_bytes());
+        }
+        let _ = child_stdin.write_all(b"exit\n");
+        let _ = child_stdin.flush();
+        drop(child_stdin);
+
+        loop {
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    exit_status = Some(st);
+                    completed_cmds = commands.len();
+                    break;
+                }
+                Ok(None) => {
+                    if Instant::now() >= total_deadline {
+                        timed_out = true;
+                        timed_out_cmd = "batch session".to_string();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(e) => return Err(format!("SSH wait error: {e}")),
+            }
+        }
+    }
+
+    if timed_out || exit_status.is_none() {
+        let _ = child.kill();
+        if let Ok(st) = child.wait() {
+            exit_status = Some(st);
+        }
+    }
+
+    let _ = out_handle.join();
+    let _ = err_handle.join();
+
+    let stdout = stdout_buf.lock().map(|g| g.clone()).unwrap_or_default();
+    let stderr = stderr_buf.lock().map(|g| g.clone()).unwrap_or_default();
+
+    log_lines.push(format!(
+        "[+{:.2}s] session_end timed_out={timed_out} exit={:?} stdout_bytes={} stderr_bytes={}",
+        session_start.elapsed().as_secs_f64(),
+        exit_status.and_then(|s| s.code()),
+        stdout.len(),
+        stderr.len()
+    ));
+    if !stderr.trim().is_empty() {
+        log_lines.push(format!("--- ssh stderr ---\n{}", stderr.trim()));
+    }
+    write_debug_log(&log_path, &log_lines);
+
+    if target.debug {
+        eprintln!("[debug] SSH diagnostic log: {}", log_path.display());
+    }
+
+    let has_usable_telemetry = !stdout.trim().is_empty()
+        && (completed_cmds > 1
+            || stdout.contains("tloc entries for ")
+            || stdout.contains("tunnel stats ")
+            || stdout.contains("app-route statistics ")
+            || stdout.contains("SYSTEM IP"));
+
+    if timed_out {
+        if has_usable_telemetry {
+            eprintln!(
+                "[warn] SSH timed out after {}s during '{}' — continuing with partial telemetry ({} bytes). Debug log: {}",
+                target.timeout_secs,
+                timed_out_cmd,
+                stdout.len(),
+                log_path.display()
+            );
+            return Ok(stdout);
+        }
+        return Err(format!(
+            "SSH session to {} timed out after {}s during '{}' (debug log: {}){}",
+            target.host,
+            target.timeout_secs,
+            timed_out_cmd,
+            log_path.display(),
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            }
+        ));
+    }
+
+    if exit_status.is_some_and(|s| !s.success()) && stdout.trim().is_empty() {
+        return Err(format!(
+            "SSH to {}@{} failed (exit {:?}, debug log: {}): {}",
+            target.user,
+            target.host,
+            exit_status.and_then(|s| s.code()),
+            log_path.display(),
+            stderr.trim()
+        ));
+    }
+
+    Ok(stdout)
 }
 
 /// Collects a full `RouterSnapshot` from either an IOS-XE `cEdge` router or a `vSmart` controller over SSH.
@@ -271,15 +594,7 @@ pub fn collect_via_ssh(target: &SshTarget<'_>) -> Result<RouterSnapshot, String>
         cmds.push(flow.to_string());
     }
 
-    let raw = run_ssh_commands(
-        target.host,
-        target.user,
-        target.port,
-        target.identity_file,
-        target.password,
-        &cmds,
-        30,
-    )?;
+    let raw = run_ssh_commands(target, &cmds)?;
 
     if target.is_vsmart {
         let tlocs = parse_omp_tlocs(&raw);
@@ -351,4 +666,21 @@ pub(crate) fn extract_system_identity(raw: &str, fallback_host: &str) -> (String
         }
     }
     (sys_ip, site_id, host_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{looks_like_prompt_tail, tail_has_more_prompt};
+
+    #[test]
+    fn detects_iosxe_and_ignores_banners() {
+        assert!(looks_like_prompt_tail("\n\nsite101-kit1#"));
+        assert!(looks_like_prompt_tail("output line\r\nvsmart# "));
+        assert!(looks_like_prompt_tail("sdwan-border1>"));
+        assert!(!looks_like_prompt_tail("###### WARNING ######"));
+        assert!(!looks_like_prompt_tail("Generating output, please wait ..."));
+        assert!(!looks_like_prompt_tail("site101-kit1#show sdwan omp tlocs\n"));
+        assert!(tail_has_more_prompt("line 1\r\n --More-- "));
+        assert!(!tail_has_more_prompt("line 1\r\nsite101-kit1#"));
+    }
 }

@@ -30,6 +30,8 @@ enum CommandMode {
         vsmart: bool,
         vpn: String,
         flow: Option<String>,
+        timeout_secs: u64,
+        debug: bool,
     },
     Vmanage {
         host: Option<String>,
@@ -59,24 +61,25 @@ fn print_help() {
         r#"tloc-explain — Cisco Catalyst SD-WAN TLOC, OMP Route & Transport Preferencing Explainer
 
 USAGE:
-  tloc-explain [ssh] <host> [-u <user>] [-p <port>] [-i <keyfile>] [-P|--ask-pass] [--password-env <VAR>] [--vsmart] [--vpn <id>] [--flow <spec>] [--json] [--markdown <file>] [--no-color]
+  tloc-explain [ssh] <host> [-u <user>] [-p <port>] [-i <keyfile>] [-P|--ask-pass] [--password-env <VAR>] [--timeout <secs>] [-v|--debug] [--vsmart] [--vpn <id>] [--flow <spec>] [--json] [--markdown <file>] [--no-color]
   tloc-explain vmanage [--host <host:port>] [--user <user>] [--device <name|sysip|all>] [--vpn <id>] [--insecure] [--json] [--markdown <file>] [--no-color]
   tloc-explain file <capture.txt> [--hostname <name>] [--system-ip <ip>] [--site-id <id>] [--json] [--markdown <file>] [--no-color]
 
 EXAMPLES:
   tloc-explain 10.10.1.21 -u admin
-  tloc-explain 10.10.1.21 -u admin -P
+  tloc-explain 10.10.1.21 -u admin -P --timeout 180 -v
   tloc-explain 10.10.1.21 -u admin -i ~/.ssh/id_ed25519
   tloc-explain 172.16.1.21 --markdown /tmp/border1-report.md
   tloc-explain ssh 172.16.1.12 -u admin --vsmart
   tloc-explain file router_capture.txt --hostname site101-kit1 --system-ip 10.255.1.11 --site-id 1011
   tloc-explain vmanage --device all
 
-AUTHENTICATION:
+AUTHENTICATION & DIAGNOSTICS:
   Direct SSH uses `-i <keyfile>` if given, or checks TLOC_SSH_PASS / ROUTER_SSH_PASS
   (env, ~/.tloc_env, /home/russb/code/sdwan-lab/.vmanage_env). When no env password is
   found or `-P` / `--ask-pass` is passed, `tloc-explain` prompts securely with hidden
   input on `/dev/tty` (never echoed or exposed in CLI arguments).
+  Diagnostic SSH logs are always written to ~/.cache/tloc-explain/tloc-explain-debug.log.
 "#
     );
 }
@@ -103,6 +106,8 @@ fn parse_ssh_args(args: &[String]) -> Result<CliArgs, String> {
     let mut vsmart = false;
     let mut vpn = "1000".to_string();
     let mut flow = None;
+    let mut timeout_secs = 120u64;
+    let mut debug = false;
 
     let mut i = 0usize;
     while i < args.len() {
@@ -120,6 +125,14 @@ fn parse_ssh_args(args: &[String]) -> Result<CliArgs, String> {
             "-P" | "--ask-pass" => ask_pass = true,
             "--password" => password = Some(take_val(args, &mut i, "--password")?),
             "--password-env" => password_env = Some(take_val(args, &mut i, "--password-env")?),
+            "--timeout" => {
+                let s = take_val(args, &mut i, "--timeout")?;
+                timeout_secs = s.parse::<u64>().map_err(|_| format!("Invalid timeout: {s}"))?;
+                if timeout_secs == 0 {
+                    return Err("--timeout must be at least 1 second".to_string());
+                }
+            }
+            "-v" | "--debug" => debug = true,
             "--vsmart" => vsmart = true,
             "--vpn" => vpn = take_val(args, &mut i, "--vpn")?,
             "--flow" => flow = Some(take_val(args, &mut i, "--flow")?),
@@ -148,6 +161,8 @@ fn parse_ssh_args(args: &[String]) -> Result<CliArgs, String> {
             vsmart,
             vpn,
             flow,
+            timeout_secs,
+            debug,
         },
         json,
         markdown_out,
@@ -350,6 +365,8 @@ fn main() {
             vsmart,
             vpn,
             flow,
+            timeout_secs,
+            debug,
         } => {
             let resolved_pw = if *ask_pass && identity_file.is_none() {
                 match prompt_password_hidden(&format!("Password for {user}@{host}: ")) {
@@ -384,6 +401,8 @@ fn main() {
                 is_vsmart: *vsmart,
                 vpn_id: vpn,
                 flow_spec: flow.as_deref(),
+                timeout_secs: *timeout_secs,
+                debug: *debug,
             }) {
                 Ok(snap) => vec![explain_snapshot(snap)],
                 Err(e) => {
@@ -487,6 +506,9 @@ mod tests {
             "-i",
             "/home/russb/.ssh/id_ed25519",
             "-P",
+            "--timeout",
+            "180",
+            "-v",
             "--vpn",
             "1000",
         ]
@@ -502,6 +524,8 @@ mod tests {
                 identity_file,
                 ask_pass,
                 vpn,
+                timeout_secs,
+                debug,
                 ..
             } => {
                 assert_eq!(host, "10.10.1.21");
@@ -509,6 +533,8 @@ mod tests {
                 assert_eq!(identity_file.as_deref(), Some("/home/russb/.ssh/id_ed25519"));
                 assert!(ask_pass);
                 assert_eq!(vpn, "1000");
+                assert_eq!(timeout_secs, 180);
+                assert!(debug);
             }
             _ => panic!("expected Ssh mode"),
         }
