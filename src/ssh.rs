@@ -175,10 +175,10 @@ pub fn collect_via_ssh(
     } else {
         vec![
             "terminal length 0".to_string(),
-            "show sdwan system status".to_string(),
+            "show sdwan control local-properties".to_string(),
             "show sdwan running-config sdwan".to_string(),
             "show sdwan omp tlocs".to_string(),
-            format!("show sdwan omp routes vpn {vpn_id} detail"),
+            format!("show sdwan omp routes vpn {vpn_id}"),
             "show sdwan bfd sessions".to_string(),
             "show sdwan tunnel statistics".to_string(),
             "show sdwan app-route stats".to_string(),
@@ -207,21 +207,49 @@ pub fn collect_via_ssh(
     Ok(build_snapshot_from_text(&host_name, &sys_ip, &site_id, "ssh", &raw))
 }
 
-fn extract_system_identity(raw: &str, fallback_host: &str) -> (String, String, String) {
+pub(crate) fn extract_system_identity(raw: &str, fallback_host: &str) -> (String, String, String) {
     let mut sys_ip = String::new();
     let mut site_id = String::new();
     let mut host_name = String::new();
 
     for line in raw.lines() {
         let t = line.trim();
+        // Stop scanning whitespace key/values once we enter remote OMP/tunnel tables so peer IDs
+        // cannot overwrite local identity.
+        if t.starts_with("tloc entries for ")
+            || t.starts_with("tunnel stats ")
+            || t.starts_with("app-route statistics ")
+        {
+            break;
+        }
         if let Some(v) = t.strip_prefix("System IP:") {
-            sys_ip = v.trim().to_string();
+            if sys_ip.is_empty() {
+                sys_ip = v.trim().to_string();
+            }
         } else if let Some(v) = t.strip_prefix("Site ID:") {
-            site_id = v.trim().to_string();
-        } else if let Some(v) = t.strip_prefix("Personality:") {
-            let _ = v;
+            if site_id.is_empty() {
+                site_id = v.trim().to_string();
+            }
         } else if let Some(v) = t.strip_prefix("Host Name:") {
-            host_name = v.trim().to_string();
+            if host_name.is_empty() {
+                host_name = v.trim().to_string();
+            }
+        } else {
+            let mut parts = t.split_whitespace();
+            if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                match k {
+                    "system-ip" if sys_ip.is_empty() && v.parse::<std::net::Ipv4Addr>().is_ok() => {
+                        sys_ip = v.to_string();
+                    }
+                    "site-id" if site_id.is_empty() && !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()) => {
+                        site_id = v.to_string();
+                    }
+                    "host-name" if host_name.is_empty() && !v.is_empty() => {
+                        host_name = v.to_string();
+                    }
+                    _ => {}
+                }
+            }
         }
     }
     if host_name.is_empty() {

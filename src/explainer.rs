@@ -733,4 +733,135 @@ app-route statistics 10.10.2.21 172.16.1.21 ipsec 12346 12346
         assert!(codes.contains(&"EQUAL_TLOC_PREFERENCE_ECMP"));
         assert!(!codes.contains(&"SLA_CLASS_INDEX_ZERO_ONLY"));
     }
+
+    #[test]
+    fn parses_iosxe_17_ssh_formats_without_vmanage() {
+        let iosxe_ssh_capture = r#"
+site101-kit1#terminal length 0
+site101-kit1#show sdwan control local-properties
+personality                       vedge
+site-id                           1011
+system-ip                         10.255.1.11
+site101-kit1#show sdwan running-config sdwan
+sdwan
+ interface GigabitEthernet1
+  tunnel-interface
+   encapsulation ipsec preference 200 weight 1
+   color biz-internet
+  exit
+ exit
+ interface GigabitEthernet2
+  tunnel-interface
+   encapsulation ipsec preference 100 weight 1
+   color public-internet
+  exit
+ exit
+!
+site101-kit1#show sdwan omp tlocs
+---------------------------------------------------
+tloc entries for 10.255.1.1
+                 biz-internet
+                 ipsec
+---------------------------------------------------
+            RECEIVED FROM:
+peer            10.255.0.3
+status          C,I,R
+    Attributes:
+     public-ip         172.16.1.21
+     private-ip        172.16.1.21
+     site-id           10
+     preference        200
+     weight            1
+---------------------------------------------------
+tloc entries for 10.255.1.1
+                 public-internet
+                 ipsec
+---------------------------------------------------
+            RECEIVED FROM:
+peer            10.255.0.3
+status          C,I,R
+    Attributes:
+     public-ip         172.16.2.21
+     private-ip        172.16.2.21
+     site-id           10
+     preference        0
+     weight            1
+---------------------------------------------------
+tloc entries for 10.255.1.11
+                 biz-internet
+                 ipsec
+---------------------------------------------------
+            RECEIVED FROM:
+peer            0.0.0.0
+status          C,Red,R
+    Attributes:
+     public-ip         10.10.1.21
+     private-ip        10.10.1.21
+     site-id           1011
+     preference        200
+     weight            1
+            ADVERTISED TO:
+peer            10.255.0.3
+    Attributes:
+     public-ip         10.10.1.21
+     preference        200
+site101-kit1#show sdwan omp routes vpn 1000
+TENANT    VPN    PREFIX              FROM PEER        ID     LABEL    STATUS    TYPE       TLOC IP          COLOR            ENCAP  PREFERENCE  NUMBER      REGION ID   REGION PATH
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+0         1000   0.0.0.0/0           10.255.0.3       1      1003     C,I,R     installed  10.255.1.1       biz-internet     ipsec  -           None        None        -
+                                     10.255.0.3       2      1003     R         installed  10.255.1.1       public-internet  ipsec  -           None        None        -
+0         1000   10.101.1.0/26       0.0.0.0          68     1003     C,Red,R   installed  10.255.1.11      biz-internet     ipsec  -           None        None        -
+site101-kit1#show sdwan bfd sessions
+SYSTEM IP        SITE ID     STATE       SOURCE TLOC      REMOTE TLOC                                      DST PUBLIC                      DST PUBLIC         DETECT      TX
+10.255.1.1       10          up          biz-internet     biz-internet     10.10.1.21                                      172.16.1.21                                     12346       ipsec  3           1000           0:00:47:43      3
+10.255.1.1       10          up          public-internet  public-internet  10.10.2.21                                      172.16.2.21                                     12346       ipsec  7           1000           0:05:25:12      1
+site101-kit1#show sdwan app-route stats
+app-route statistics 10.10.1.21 172.16.1.21 ipsec 12346 12346
+ remote-system-ip 10.255.1.1
+ local-color biz-internet
+ remote-color biz-internet
+ sla-class-index 0
+ interval 0
+  tx-data-pkts 18
+  rx-data-pkts 18
+app-route statistics 10.10.2.21 172.16.2.21 ipsec 12346 12346
+ remote-system-ip 10.255.1.1
+ local-color public-internet
+ remote-color public-internet
+ sla-class-index 0
+ interval 0
+  tx-data-pkts 0
+  rx-data-pkts 0
+"#;
+        let (sys_ip, site_id, host_name) =
+            crate::ssh::extract_system_identity(iosxe_ssh_capture, "10.10.1.21");
+        assert_eq!(sys_ip, "10.255.1.11");
+        assert_eq!(site_id, "1011");
+        assert_eq!(host_name, "site101-kit1");
+
+        let snap = build_snapshot_from_text(&host_name, &sys_ip, &site_id, "ssh", iosxe_ssh_capture);
+        let local_biz = snap
+            .local_tlocs
+            .iter()
+            .find(|t| t.color == "biz-internet")
+            .expect("local biz-internet present");
+        assert_eq!(local_biz.public_ip, "10.10.1.21");
+        assert_eq!(local_biz.bfd_status, "C,Red,R");
+        assert_eq!(snap.remote_tlocs.len(), 2);
+
+        let report = explain_snapshot(snap);
+        assert_eq!(report.route_explanations.len(), 1);
+        assert_eq!(report.route_explanations[0].prefix, "0.0.0.0/0");
+        assert_eq!(report.route_explanations[0].winning_color, "biz-internet");
+        assert_eq!(report.route_explanations[0].backup_paths.len(), 1);
+
+        let primary = report
+            .tunnel_verdicts
+            .iter()
+            .find(|v| v.local_ip == "10.10.1.21" && v.remote_ip == "172.16.1.21")
+            .expect("primary BFD+app-route tunnel merged");
+        assert_eq!(primary.bfd_state, "up");
+        assert_eq!(primary.detect_multiplier, 3);
+        assert_eq!(primary.verdict, VerdictKind::ActivePrimary);
+    }
 }

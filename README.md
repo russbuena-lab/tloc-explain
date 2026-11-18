@@ -17,10 +17,10 @@ Standalone, zero-warning Rust CLI (`x86_64-unknown-linux-musl` static binary) th
   - `BACKUP_TRANSPORT_DATA_BLEED`: Alerts when a non-primary transport carries live user traffic while primary WAN is up.
   - `EQUAL_TLOC_PREFERENCE_ECMP`: Flags identical TLOC preferences causing unintended ECMP onto metered circuits.
   - `REMOTE_TLOC_PREF_UNSET_ZERO` & `BFD_SESSION_DOWN` / `BFD_SESSION_FLAPPED`.
-- **Three Input Modes:**
-  - `vmanage`: Queries `vManage` real-time APIs concurrently (`tokio::join!`) across one device or `--device all`.
-  - `ssh`: Connects directly to a `cEdge` or `--vsmart` router using read-only `show` commands via ephemeral `0700` `SSH_ASKPASS` (zero password exposure on `argv`).
-  - `file`: Parses offline CLI captures cleanly.
+- **Direct Router First (No vManage Required):**
+  - **Direct Router SSH (default):** `tloc-explain <router-ip>` connects straight to a `cEdge` (or `--vsmart`) via native OpenSSH with read-only `show` commands and ephemeral `0700` `SSH_ASKPASS` (zero password exposure on `argv`). Supports `TLOC_SSH_PASS` / `ROUTER_SSH_PASS` (env or `~/.tloc_env` / `/home/russb/code/sdwan-lab/.vmanage_env`), `--password <pw>`, or `--password-env <VAR>`.
+  - **`file`:** Parses offline CLI captures cleanly.
+  - **`vmanage` (optional):** Queries `vManage` real-time APIs concurrently (`tokio::join!`) across one device or `--device all`.
 
 ## Build & Install
 
@@ -35,16 +35,17 @@ cp target/x86_64-unknown-linux-musl/release/tloc-explain ~/.local/bin/tloc-expla
 ## Usage Examples
 
 ```bash
-# Explain all reachable WAN Edges via vManage
-tloc-explain vmanage --device all
+# Run directly on a cEdge router over SSH (no vManage required)
+tloc-explain 10.10.1.21
+tloc-explain 172.16.1.21 -u admin --vpn 1000 --markdown /tmp/border1.md
 
-# Export Markdown report for a single site
-tloc-explain vmanage --device site101-kit1 --markdown /tmp/site101-kit1.md
-
-# Connect directly to a cEdge router or vSmart over SSH
-tloc-explain ssh 10.10.1.21 -u admin --vpn 1000
-tloc-explain ssh 172.16.1.12 -u admin --vsmart
+# Explicit ssh subcommand or vSmart controller inspection
+tloc-explain ssh 10.10.1.21 --password '<pw>'
+tloc-explain 172.16.1.12 -u admin --vsmart
 
 # Analyze an offline CLI capture file
 tloc-explain file capture.txt --hostname site101-kit1 --system-ip 10.255.1.11 --site-id 1011
+
+# Optional: explain all reachable WAN Edges via vManage API
+tloc-explain vmanage --device all
 ```

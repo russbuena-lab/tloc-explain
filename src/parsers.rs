@@ -246,6 +246,31 @@ pub fn parse_omp_tlocs(text: &str) -> Vec<TlocEntry> {
     let mut cur_color = String::new();
     let mut cur_encap = String::new();
     let mut active: Option<TlocEntry> = None;
+    let mut active_is_advertised = false;
+
+    let push_tloc_entry = |out: &mut Vec<TlocEntry>, entry: TlocEntry, is_advertised: bool| {
+        if is_advertised {
+            if let Some(existing) = out.iter_mut().rev().find(|e| {
+                e.system_ip == entry.system_ip && e.color == entry.color && e.encap == entry.encap
+            }) {
+                // ADVERTISED TO blocks lack `status` / `bfd-status`; never overwrite RECEIVED FROM fields.
+                if existing.public_ip.is_empty() && !entry.public_ip.is_empty() {
+                    existing.public_ip = entry.public_ip;
+                }
+                if existing.private_ip.is_empty() && !entry.private_ip.is_empty() {
+                    existing.private_ip = entry.private_ip;
+                }
+                if existing.site_id.is_empty() && !entry.site_id.is_empty() {
+                    existing.site_id = entry.site_id;
+                }
+                if existing.bfd_status.is_empty() && !entry.bfd_status.is_empty() {
+                    existing.bfd_status = entry.bfd_status;
+                }
+                return;
+            }
+        }
+        out.push(entry);
+    };
 
     let lines: Vec<&str> = text.lines().collect();
     let mut i = 0usize;
@@ -253,7 +278,7 @@ pub fn parse_omp_tlocs(text: &str) -> Vec<TlocEntry> {
         let trimmed = lines[i].trim();
         if let Some(caps) = hdr_re.captures(trimmed) {
             if let Some(prev) = active.take() {
-                out.push(prev);
+                push_tloc_entry(&mut out, prev, active_is_advertised);
             }
             cur_sys_ip = caps[1].to_string();
             cur_color.clear();
@@ -275,9 +300,10 @@ pub fn parse_omp_tlocs(text: &str) -> Vec<TlocEntry> {
             || trimmed.starts_with("tunnel stats ")
             || trimmed.starts_with("app-route statistics ")
             || trimmed.contains("# show ")
+            || trimmed.contains("#show ")
         {
             if let Some(prev) = active.take() {
-                out.push(prev);
+                push_tloc_entry(&mut out, prev, active_is_advertised);
             }
             cur_sys_ip.clear();
             cur_color.clear();
@@ -288,8 +314,9 @@ pub fn parse_omp_tlocs(text: &str) -> Vec<TlocEntry> {
 
         if trimmed.starts_with("RECEIVED FROM:") || trimmed.starts_with("ADVERTISED TO:") {
             if let Some(prev) = active.take() {
-                out.push(prev);
+                push_tloc_entry(&mut out, prev, active_is_advertised);
             }
+            active_is_advertised = trimmed.starts_with("ADVERTISED TO:");
             if !cur_sys_ip.is_empty() {
                 active = Some(TlocEntry {
                     system_ip: cur_sys_ip.clone(),
@@ -322,7 +349,7 @@ pub fn parse_omp_tlocs(text: &str) -> Vec<TlocEntry> {
     }
 
     if let Some(prev) = active.take() {
-        out.push(prev);
+        push_tloc_entry(&mut out, prev, active_is_advertised);
     }
 
     // Fallback for tabular `show omp tlocs | tab` or IOS-XE summary table
@@ -429,12 +456,35 @@ pub fn parse_omp_routes(text: &str) -> Vec<OmpRouteEntry> {
         let mut last_vpn = String::new();
         let mut last_prefix = String::new();
         for raw in text.lines() {
-            let tokens: Vec<&str> = raw.split_whitespace().collect();
+            let trimmed = raw.trim();
+            if trimmed.is_empty()
+                || trimmed.contains('#')
+                || trimmed.starts_with("tloc entries")
+                || trimmed.starts_with("tunnel stats")
+                || trimmed.starts_with("app-route statistics")
+                || trimmed.starts_with("SYSTEM IP")
+            {
+                last_vpn.clear();
+                last_prefix.clear();
+                continue;
+            }
+            let tokens: Vec<&str> = trimmed.split_whitespace().collect();
             if tokens.len() < 7 {
                 continue;
             }
-            // Match either full row starting with <vpn> <prefix> or continuation starting with <from-peer>
-            if tokens[0].chars().all(|c| c.is_ascii_digit()) && tokens[1].contains('/') {
+            // Match IOS-XE 17.x multi-tenant format (<tenant> <vpn> <prefix> <from_peer> ...),
+            // legacy format (<vpn> <prefix> <from_peer> ...), or continuation starting with <from_peer>.
+            if tokens.len() >= 11
+                && tokens[0].chars().all(|c| c.is_ascii_digit())
+                && tokens[1].chars().all(|c| c.is_ascii_digit())
+                && is_cidr_prefix(tokens[2])
+            {
+                last_vpn = tokens[1].to_string();
+                last_prefix = tokens[2].to_string();
+                if let Some(entry) = parse_tabular_route_tokens(&last_vpn, &last_prefix, &tokens[3..]) {
+                    out.push(entry);
+                }
+            } else if tokens[0].chars().all(|c| c.is_ascii_digit()) && is_cidr_prefix(tokens[1]) {
                 last_vpn = tokens[0].to_string();
                 last_prefix = tokens[1].to_string();
                 // Columns typically: VPN PREFIX FROM_PEER PATH_ID LABEL STATUS ATTR_TYPE TLOC_IP COLOR ENCAP
@@ -450,6 +500,12 @@ pub fn parse_omp_routes(text: &str) -> Vec<OmpRouteEntry> {
     }
 
     out
+}
+
+fn is_cidr_prefix(s: &str) -> bool {
+    s.split_once('/').is_some_and(|(ip, mask)| {
+        !mask.is_empty() && mask.chars().all(|c| c.is_ascii_digit()) && (is_ipv4(ip) || ip.contains(':'))
+    })
 }
 
 fn parse_tabular_route_tokens(vpn: &str, prefix: &str, rest: &[&str]) -> Option<OmpRouteEntry> {
@@ -472,15 +528,26 @@ fn parse_tabular_route_tokens(vpn: &str, prefix: &str, rest: &[&str]) -> Option<
         .iter()
         .find(|t| {
             let up = t.to_ascii_uppercase();
-            up == "R" || up.contains("C,") || up.contains("I,") || up.contains("RED")
+            up == "R"
+                || up == "C"
+                || up == "U"
+                || up.contains("C,")
+                || up.contains("I,")
+                || up.contains(",R")
+                || up.contains("RED")
+                || up == "INV"
+                || up == "REJ"
         })
         .copied()
         .unwrap_or("")
         .to_string();
+    if status.is_empty() {
+        return None;
+    }
     Some(OmpRouteEntry {
         vpn_id: vpn.to_string(),
         prefix: prefix.to_string(),
-        from_peer: from_peer.clone(),
+        from_peer,
         originator: next_hop_tloc_ip.clone(),
         next_hop_tloc_ip,
         site_id: String::new(),
@@ -498,20 +565,55 @@ pub fn parse_bfd_sessions(text: &str) -> Vec<TunnelDiag> {
     let mut out = Vec::new();
     for raw in text.lines() {
         let tokens: Vec<&str> = raw.split_whitespace().collect();
-        if tokens.len() < 10 || !is_ipv4(tokens[0]) || !is_ipv4(tokens[1]) {
+        if tokens.len() < 10 || !is_ipv4(tokens[0]) {
             continue;
         }
-        // Format: SRC_IP DST_IP PROTO SRC_PORT DST_PORT SYSTEM_IP SITE_ID STATE DETECT_MULT TX_INT UPTIME TRANSITIONS LOCAL_COLOR COLOR
-        let src_ip = tokens[0].to_string();
-        let dst_ip = tokens[1].to_string();
-        let sys_ip = tokens.get(5).copied().unwrap_or("").to_string();
-        let state = tokens.get(7).copied().unwrap_or("").to_lowercase();
-        let mult = tokens.get(8).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
-        let tx_int = tokens.get(9).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1000);
-        let uptime = tokens.get(10).copied().unwrap_or("").to_string();
-        let transitions = tokens.get(11).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-        let local_color = tokens.get(12).copied().unwrap_or("").to_string();
-        let remote_color = tokens.get(13).copied().unwrap_or("").to_string();
+        let (
+            src_ip,
+            dst_ip,
+            sys_ip,
+            state,
+            mult,
+            tx_int,
+            uptime,
+            transitions,
+            local_color,
+            remote_color,
+        ) = if tokens.len() >= 13 && !is_ipv4(tokens[1]) && is_ipv4(tokens[5]) && is_ipv4(tokens[6])
+        {
+            // IOS-XE 17.x format:
+            // SYSTEM_IP SITE_ID STATE SOURCE_COLOR REMOTE_COLOR SOURCE_IP DST_PUBLIC_IP DST_PORT ENCAP DETECT_MULTIPLIER TX_INTERVAL UPTIME TRANSITIONS
+            (
+                tokens[5].to_string(),
+                tokens[6].to_string(),
+                tokens[0].to_string(),
+                tokens[2].to_lowercase(),
+                tokens[9].parse::<u32>().unwrap_or(0),
+                tokens[10].parse::<u32>().unwrap_or(1000),
+                tokens[11].to_string(),
+                tokens[12].parse::<u64>().unwrap_or(0),
+                tokens[3].to_string(),
+                tokens[4].to_string(),
+            )
+        } else if is_ipv4(tokens[1]) {
+            // Legacy Viptela format:
+            // SRC_IP DST_IP PROTO SRC_PORT DST_PORT SYSTEM_IP SITE_ID STATE DETECT_MULT TX_INT UPTIME TRANSITIONS LOCAL_COLOR COLOR
+            (
+                tokens[0].to_string(),
+                tokens[1].to_string(),
+                tokens.get(5).copied().unwrap_or("").to_string(),
+                tokens.get(7).copied().unwrap_or("").to_lowercase(),
+                tokens.get(8).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0),
+                tokens.get(9).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1000),
+                tokens.get(10).copied().unwrap_or("").to_string(),
+                tokens.get(11).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0),
+                tokens.get(12).copied().unwrap_or("").to_string(),
+                tokens.get(13).copied().unwrap_or("").to_string(),
+            )
+        } else {
+            continue;
+        };
+
         out.push(TunnelDiag {
             local_ip: src_ip,
             remote_ip: dst_ip,

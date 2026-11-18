@@ -7,6 +7,7 @@ mod vmanage;
 
 use std::fs;
 use std::io::{self, IsTerminal};
+use std::path::PathBuf;
 use std::process;
 
 use crate::explainer::explain_snapshot;
@@ -22,7 +23,8 @@ enum CommandMode {
         host: String,
         user: String,
         port: u16,
-        password_env: String,
+        password: Option<String>,
+        password_env: Option<String>,
         vsmart: bool,
         vpn: String,
         flow: Option<String>,
@@ -55,18 +57,92 @@ fn print_help() {
         r#"tloc-explain — Cisco Catalyst SD-WAN TLOC, OMP Route & Transport Preferencing Explainer
 
 USAGE:
-  tloc-explain ssh <host> [-u <user>] [-p <port>] [--password-env <VAR>] [--vsmart] [--vpn <id>] [--flow <spec>] [--json] [--markdown <file>]
-  tloc-explain vmanage [--host <host:port>] [--user <user>] [--device <name|sysip|all>] [--vpn <id>] [--insecure] [--json] [--markdown <file>]
-  tloc-explain file <capture.txt> [--hostname <name>] [--system-ip <ip>] [--site-id <id>] [--json] [--markdown <file>]
+  tloc-explain [ssh] <host> [-u <user>] [-p <port>] [--password <pw>] [--password-env <VAR>] [--vsmart] [--vpn <id>] [--flow <spec>] [--json] [--markdown <file>] [--no-color]
+  tloc-explain vmanage [--host <host:port>] [--user <user>] [--device <name|sysip|all>] [--vpn <id>] [--insecure] [--json] [--markdown <file>] [--no-color]
+  tloc-explain file <capture.txt> [--hostname <name>] [--system-ip <ip>] [--site-id <id>] [--json] [--markdown <file>] [--no-color]
 
 EXAMPLES:
-  tloc-explain vmanage --device all
-  tloc-explain vmanage --device site101-kit1 --markdown /tmp/kit1-report.md
-  tloc-explain ssh 10.10.1.21 -u admin --vpn 1000
+  tloc-explain 10.10.1.21
+  tloc-explain 10.10.1.21 -u admin --vpn 1000
+  tloc-explain 172.16.1.21 --markdown /tmp/border1-report.md
   tloc-explain ssh 172.16.1.12 -u admin --vsmart
   tloc-explain file router_capture.txt --hostname site101-kit1 --system-ip 10.255.1.11 --site-id 1011
+  tloc-explain vmanage --device all
+
+ENVIRONMENT:
+  Direct router SSH automatically checks TLOC_SSH_PASS and ROUTER_SSH_PASS in the
+  process environment, ~/.tloc_env, and /home/russb/code/sdwan-lab/.vmanage_env
+  (falling back to VMANAGE_PASSWORD for vSmart or shared credentials).
 "#
     );
+}
+
+fn take_val(args: &[String], idx: &mut usize, flag: &str) -> Result<String, String> {
+    *idx += 1;
+    args.get(*idx)
+        .cloned()
+        .ok_or_else(|| format!("Missing value for {flag}"))
+}
+
+fn parse_ssh_args(args: &[String]) -> Result<CliArgs, String> {
+    let mut json = false;
+    let mut markdown_out = None;
+    let mut no_color = !io::stdout().is_terminal();
+
+    let mut host = String::new();
+    let mut user = "admin".to_string();
+    let mut port = 22u16;
+    let mut password = None;
+    let mut password_env = None;
+    let mut vsmart = false;
+    let mut vpn = "1000".to_string();
+    let mut flow = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                print_help();
+                process::exit(0);
+            }
+            "-u" | "--user" => user = take_val(args, &mut i, "--user")?,
+            "-p" | "--port" => {
+                let s = take_val(args, &mut i, "--port")?;
+                port = s.parse::<u16>().map_err(|_| format!("Invalid port: {s}"))?;
+            }
+            "--password" => password = Some(take_val(args, &mut i, "--password")?),
+            "--password-env" => password_env = Some(take_val(args, &mut i, "--password-env")?),
+            "--vsmart" => vsmart = true,
+            "--vpn" => vpn = take_val(args, &mut i, "--vpn")?,
+            "--flow" => flow = Some(take_val(args, &mut i, "--flow")?),
+            "--json" => json = true,
+            "--markdown" => markdown_out = Some(take_val(args, &mut i, "--markdown")?),
+            "--no-color" => no_color = true,
+            arg if !arg.starts_with('-') && host.is_empty() => host = arg.to_string(),
+            other => return Err(format!("Unknown argument: {other}")),
+        }
+        i += 1;
+    }
+
+    if host.is_empty() {
+        return Err("Missing <host> argument for direct router SSH".to_string());
+    }
+
+    Ok(CliArgs {
+        mode: CommandMode::Ssh {
+            host,
+            user,
+            port,
+            password,
+            password_env,
+            vsmart,
+            vpn,
+            flow,
+        },
+        json,
+        markdown_out,
+        no_color,
+    })
 }
 
 fn parse_args() -> Result<CliArgs, String> {
@@ -82,60 +158,9 @@ fn parse_args() -> Result<CliArgs, String> {
     let mut no_color = !io::stdout().is_terminal();
 
     let mut i = 1usize;
-    let take_val = |idx: &mut usize, flag: &str| -> Result<String, String> {
-        *idx += 1;
-        args.get(*idx)
-            .cloned()
-            .ok_or_else(|| format!("Missing value for {flag}"))
-    };
 
     match sub {
-        "ssh" => {
-            let mut host = String::new();
-            let mut user = "admin".to_string();
-            let mut port = 22u16;
-            let mut password_env = "TLOC_SSH_PASS".to_string();
-            let mut vsmart = false;
-            let mut vpn = "1000".to_string();
-            let mut flow = None;
-
-            while i < args.len() {
-                match args[i].as_str() {
-                    "-u" | "--user" => user = take_val(&mut i, "--user")?,
-                    "-p" | "--port" => {
-                        let s = take_val(&mut i, "--port")?;
-                        port = s.parse::<u16>().map_err(|_| format!("Invalid port: {s}"))?;
-                    }
-                    "--password-env" => password_env = take_val(&mut i, "--password-env")?,
-                    "--vsmart" => vsmart = true,
-                    "--vpn" => vpn = take_val(&mut i, "--vpn")?,
-                    "--flow" => flow = Some(take_val(&mut i, "--flow")?),
-                    "--json" => json = true,
-                    "--markdown" => markdown_out = Some(take_val(&mut i, "--markdown")?),
-                    "--no-color" => no_color = true,
-                    arg if !arg.starts_with('-') && host.is_empty() => host = arg.to_string(),
-                    other => return Err(format!("Unknown argument for 'ssh': {other}")),
-                }
-                i += 1;
-            }
-            if host.is_empty() {
-                return Err("Missing <host> argument for 'ssh'".to_string());
-            }
-            Ok(CliArgs {
-                mode: CommandMode::Ssh {
-                    host,
-                    user,
-                    port,
-                    password_env,
-                    vsmart,
-                    vpn,
-                    flow,
-                },
-                json,
-                markdown_out,
-                no_color,
-            })
-        }
+        "ssh" => parse_ssh_args(&args[1..]),
         "vmanage" => {
             let mut host = None;
             let mut user = None;
@@ -145,14 +170,18 @@ fn parse_args() -> Result<CliArgs, String> {
 
             while i < args.len() {
                 match args[i].as_str() {
-                    "--host" => host = Some(take_val(&mut i, "--host")?),
-                    "-u" | "--user" => user = Some(take_val(&mut i, "--user")?),
-                    "-d" | "--device" => device = take_val(&mut i, "--device")?,
-                    "--vpn" => vpn = take_val(&mut i, "--vpn")?,
+                    "-h" | "--help" => {
+                        print_help();
+                        process::exit(0);
+                    }
+                    "--host" => host = Some(take_val(&args, &mut i, "--host")?),
+                    "-u" | "--user" => user = Some(take_val(&args, &mut i, "--user")?),
+                    "-d" | "--device" => device = take_val(&args, &mut i, "--device")?,
+                    "--vpn" => vpn = take_val(&args, &mut i, "--vpn")?,
                     "--insecure" => insecure = true,
                     "--verify-tls" => insecure = false,
                     "--json" => json = true,
-                    "--markdown" => markdown_out = Some(take_val(&mut i, "--markdown")?),
+                    "--markdown" => markdown_out = Some(take_val(&args, &mut i, "--markdown")?),
                     "--no-color" => no_color = true,
                     other => return Err(format!("Unknown argument for 'vmanage': {other}")),
                 }
@@ -179,11 +208,15 @@ fn parse_args() -> Result<CliArgs, String> {
 
             while i < args.len() {
                 match args[i].as_str() {
-                    "--hostname" => hostname = take_val(&mut i, "--hostname")?,
-                    "--system-ip" => system_ip = take_val(&mut i, "--system-ip")?,
-                    "--site-id" => site_id = take_val(&mut i, "--site-id")?,
+                    "-h" | "--help" => {
+                        print_help();
+                        process::exit(0);
+                    }
+                    "--hostname" => hostname = take_val(&args, &mut i, "--hostname")?,
+                    "--system-ip" => system_ip = take_val(&args, &mut i, "--system-ip")?,
+                    "--site-id" => site_id = take_val(&args, &mut i, "--site-id")?,
                     "--json" => json = true,
-                    "--markdown" => markdown_out = Some(take_val(&mut i, "--markdown")?),
+                    "--markdown" => markdown_out = Some(take_val(&args, &mut i, "--markdown")?),
                     "--no-color" => no_color = true,
                     arg if !arg.starts_with('-') && path.is_empty() => path = arg.to_string(),
                     other => return Err(format!("Unknown argument for 'file': {other}")),
@@ -205,38 +238,66 @@ fn parse_args() -> Result<CliArgs, String> {
                 no_color,
             })
         }
-        other => Err(format!("Unknown subcommand '{other}'. Run with --help for usage.")),
+        _ => parse_ssh_args(&args),
     }
 }
 
-fn load_ssh_password(env_name: &str) -> Option<String> {
-    if let Ok(v) = std::env::var(env_name) {
+fn read_env_key_from_sources(key: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(key) {
         if !v.is_empty() {
             return Some(v);
         }
     }
-    if let Ok(v) = std::env::var("VMANAGE_PASSWORD") {
-        if !v.is_empty() {
-            return Some(v);
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            paths.push(PathBuf::from(home).join(".tloc_env"));
         }
     }
-    // Check standard Forge env files without printing secrets
-    for path in [
-        "/home/russb/code/sdwan-lab/.vmanage_env",
-        "/home/russb/code/ironclad-forge/.forge_env",
-    ] {
+    paths.push(PathBuf::from("/home/russb/code/sdwan-lab/.vmanage_env"));
+    paths.push(PathBuf::from("/home/russb/code/ironclad-forge/.forge_env"));
+
+    for path in paths {
         if let Ok(text) = fs::read_to_string(path) {
             for line in text.lines() {
-                let t = line.trim().trim_start_matches("export ").trim();
+                let t = line.trim();
+                if t.is_empty() || t.starts_with('#') {
+                    continue;
+                }
+                let t = t.strip_prefix("export ").unwrap_or(t).trim();
                 if let Some((k, v)) = t.split_once('=') {
-                    if k.trim() == "VMANAGE_PASSWORD" {
-                        let clean = v.trim().trim_matches('"').trim_matches('\'').to_string();
+                    if k.trim() == key {
+                        let raw = v.trim();
+                        let clean = if (raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2)
+                            || (raw.starts_with('"') && raw.ends_with('"') && raw.len() >= 2)
+                        {
+                            raw[1..raw.len() - 1].to_string()
+                        } else {
+                            raw.to_string()
+                        };
                         if !clean.is_empty() {
                             return Some(clean);
                         }
                     }
                 }
             }
+        }
+    }
+    None
+}
+
+fn load_ssh_password(explicit_env: Option<&str>, is_vsmart: bool) -> Option<String> {
+    if let Some(env_name) = explicit_env {
+        return read_env_key_from_sources(env_name);
+    }
+    let order: &[&str] = if is_vsmart {
+        &["VMANAGE_PASSWORD", "TLOC_SSH_PASS", "ROUTER_SSH_PASS"]
+    } else {
+        &["TLOC_SSH_PASS", "ROUTER_SSH_PASS", "VMANAGE_PASSWORD"]
+    };
+    for key in order {
+        if let Some(val) = read_env_key_from_sources(key) {
+            return Some(val);
         }
     }
     None
@@ -273,12 +334,15 @@ async fn main() {
             host,
             user,
             port,
+            password,
             password_env,
             vsmart,
             vpn,
             flow,
         } => {
-            let pw = load_ssh_password(password_env);
+            let pw = password
+                .clone()
+                .or_else(|| load_ssh_password(password_env.as_deref(), *vsmart));
             match collect_via_ssh(host, user, *port, pw.as_deref(), *vsmart, vpn, flow.as_deref()) {
                 Ok(snap) => vec![explain_snapshot(snap)],
                 Err(e) => {
