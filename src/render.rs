@@ -38,18 +38,19 @@ pub fn render_terminal(report: &AnalysisReport, use_color: bool, show_all_tunnel
         out.push_str(&format!("{c_bold}Focused Peer:{c_reset} {peer}\n"));
     }
 
-    if is_discover {
+    if report.active_primary_tunnels.is_empty() {
         out.push_str(&format!(
-            "{c_cyan}Discovery Mode:{c_reset} Pick a peer IP below and re-run with {c_bold}--peer <ip>{c_reset} for full data-plane & OMP route analysis.\n"
-        ));
-    } else if report.active_primary_tunnels.is_empty() {
-        out.push_str(&format!(
-            "{c_yellow}Summary:{c_reset} No active primary user-data tunnel detected in current telemetry.\n"
+            "{c_yellow}Summary:{c_reset} No active primary forwarding tunnel detected in current telemetry.\n"
         ));
     } else {
         out.push_str(&format!(
             "{c_green}Active Forwarding Tunnel(s):{c_reset} {}\n",
             report.active_primary_tunnels.join(" | ")
+        ));
+    }
+    if is_discover {
+        out.push_str(&format!(
+            "{c_cyan}Discovery Tip:{c_reset} Run with {c_bold}--peer <system-ip>{c_reset} on an active or target peer for 3m app-route SLA stats & TLOC preferences.\n"
         ));
     }
 
@@ -82,22 +83,31 @@ pub fn render_terminal(report: &AnalysisReport, use_color: bool, show_all_tunnel
         out.push_str(&format!("  {c_dim}(no remote peers found){c_reset}\n"));
     } else {
         out.push_str(&format!(
-            "  {c_dim}{:<16} {:<8} {:<12} {:<18} {}{c_reset}\n",
-            "Peer System IP", "Site ID", "BFD Up/Tot", "3m Data (TX/RX)", "Remote Colors & WAN IPs"
+            "  {c_dim}{:<16} {:<7} {:<6} {:<18} {:<16} {}{c_reset}\n",
+            "Peer System IP", "Site", "BFD", "OMP (C,I,R / R)", "Data (3m/Cum)", "Remote Colors & WAN IPs"
         ));
         for ps in &report.peer_summaries {
             let bfd_ratio = format!("{}/{}", ps.tunnels_up, ps.tunnels_total);
-            let data_ratio = format!("{}/{}", ps.recent_tx_pkts, ps.recent_rx_pkts);
+            let omp_ratio = if ps.is_default_route_winner {
+                format!("{}/{} [0.0.0.0/0]", ps.cir_routes, ps.backup_routes)
+            } else {
+                format!("{}/{}", ps.cir_routes, ps.backup_routes)
+            };
+            let data_ratio = format!(
+                "{}/{} (~{})",
+                ps.recent_tx_pkts, ps.recent_rx_pkts, ps.est_cum_data_pkts
+            );
             let detail = format!(
                 "{} ({})",
                 if ps.colors.is_empty() { "-".to_string() } else { ps.colors.join(", ") },
                 if ps.remote_ips.is_empty() { "-".to_string() } else { ps.remote_ips.join(", ") }
             );
             out.push_str(&format!(
-                "  {:<16} {:<8} {:<12} {:<18} {}\n",
+                "  {:<16} {:<7} {:<6} {:<18} {:<16} {}\n",
                 ps.system_ip,
                 non_empty(&ps.site_id, "-"),
                 bfd_ratio,
+                omp_ratio,
                 data_ratio,
                 detail
             ));
@@ -105,8 +115,9 @@ pub fn render_terminal(report: &AnalysisReport, use_color: bool, show_all_tunnel
     }
 
     // 3. Tunnel Verdicts
+    let discover_compact = is_discover && snap.peer_filter.is_none() && !show_all_tunnels;
     let collapse_standby =
-        snap.peer_filter.is_none() && !show_all_tunnels && report.tunnel_verdicts.len() > 8;
+        snap.peer_filter.is_none() && !show_all_tunnels && (is_discover || report.tunnel_verdicts.len() > 8);
     let mut hidden_standby = 0usize;
 
     out.push_str(&format!(
@@ -114,7 +125,15 @@ pub fn render_terminal(report: &AnalysisReport, use_color: bool, show_all_tunnel
         report.tunnel_verdicts.len()
     ));
     for tv in &report.tunnel_verdicts {
-        if collapse_standby && tv.verdict == VerdictKind::StandbyBfdOnly {
+        let should_hide = if discover_compact {
+            !matches!(
+                tv.verdict,
+                VerdictKind::ActivePrimary | VerdictKind::BackupDataBleed | VerdictKind::DownOrDegraded
+            )
+        } else {
+            collapse_standby && tv.verdict == VerdictKind::StandbyBfdOnly
+        };
+        if should_hide {
             hidden_standby += 1;
             continue;
         }
@@ -147,7 +166,7 @@ pub fn render_terminal(report: &AnalysisReport, use_color: bool, show_all_tunnel
     }
     if hidden_standby > 0 {
         out.push_str(&format!(
-            "\n  {c_dim}... plus {hidden_standby} idle STANDBY (BFD HEARTBEAT ONLY) tunnels hidden (use --peer <ip> or --all-tunnels to show all).{c_reset}\n"
+            "\n  {c_dim}... plus {hidden_standby} standby/idle tunnel(s) hidden (use --peer <ip> or --all-tunnels to show all).{c_reset}\n"
         ));
     }
 
@@ -155,14 +174,19 @@ pub fn render_terminal(report: &AnalysisReport, use_color: bool, show_all_tunnel
     out.push_str(&format!(
         "\n{c_bold}4. OMP Route Selection (Why Each Prefix Picked Its Path){c_reset}\n"
     ));
-    if is_discover {
-        out.push_str(&format!(
-            "  {c_dim}(skipped in --discover mode; re-run with --peer <ip> to inspect OMP routes){c_reset}\n"
-        ));
-    } else if report.route_explanations.is_empty() {
+    if report.route_explanations.is_empty() {
         out.push_str(&format!("  {c_dim}(no received OMP routes in snapshot){c_reset}\n"));
     } else {
+        let mut hidden_routes = 0usize;
+        let mut shown_default = 0usize;
         for re in &report.route_explanations {
+            if discover_compact && re.prefix != "0.0.0.0/0" {
+                hidden_routes += 1;
+                continue;
+            }
+            if re.prefix == "0.0.0.0/0" {
+                shown_default += 1;
+            }
             out.push_str(&format!(
                 "  - VPN {:<4} {:<18} -> Winner: {} ({}) via local {}\n    Why    : {}\n",
                 re.vpn_id,
@@ -174,6 +198,17 @@ pub fn render_terminal(report: &AnalysisReport, use_color: bool, show_all_tunnel
             ));
             if !re.backup_paths.is_empty() {
                 out.push_str(&format!("    Backup : {}\n", re.backup_paths.join(" ; ")));
+            }
+        }
+        if hidden_routes > 0 {
+            if shown_default == 0 {
+                out.push_str(&format!(
+                    "  {c_dim}(no 0.0.0.0/0 default route; {hidden_routes} other service prefix(es) hidden in --discover — pass --peer <ip> or --all-tunnels to list){c_reset}\n"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  {c_dim}... plus {hidden_routes} other service prefix(es) hidden in --discover (pass --peer <ip> or --all-tunnels to list).{c_reset}\n"
+                ));
             }
         }
     }
@@ -235,32 +270,49 @@ pub fn render_markdown(report: &AnalysisReport, show_all_tunnels: bool) -> Strin
     md.push('\n');
 
     md.push_str("## Remote Peers Summary\n\n");
-    md.push_str("| Peer System IP | Site ID | BFD (`Up/Total`) | 3m Data (`TX/RX`) | Colors | Remote WAN IPs |\n");
-    md.push_str("| :--- | :---: | :---: | :---: | :--- | :--- |\n");
+    md.push_str("| Peer System IP | Site ID | BFD (`Up/Tot`) | OMP (`C,I,R / R`) | Data (`3m / Cumul`) | Colors | Remote WAN IPs |\n");
+    md.push_str("| :--- | :---: | :---: | :---: | :---: | :--- | :--- |\n");
     for ps in &report.peer_summaries {
+        let omp_col = if ps.is_default_route_winner {
+            format!("{}/{} [0.0.0.0/0]", ps.cir_routes, ps.backup_routes)
+        } else {
+            format!("{}/{}", ps.cir_routes, ps.backup_routes)
+        };
         md.push_str(&format!(
-            "| `{}` | `{}` | `{}/{}` | `{}/{}` | `{}` | `{}` |\n",
+            "| `{}` | `{}` | `{}/{}` | `{}` | `{}/{} (~{})` | `{}` | `{}` |\n",
             ps.system_ip,
             non_empty(&ps.site_id, "-"),
             ps.tunnels_up,
             ps.tunnels_total,
+            omp_col,
             ps.recent_tx_pkts,
             ps.recent_rx_pkts,
+            ps.est_cum_data_pkts,
             if ps.colors.is_empty() { "-".to_string() } else { ps.colors.join(", ") },
             if ps.remote_ips.is_empty() { "-".to_string() } else { ps.remote_ips.join(", ") }
         ));
     }
     md.push('\n');
 
+    let is_discover = snap.source_mode == "ssh-discover";
+    let discover_compact = is_discover && snap.peer_filter.is_none() && !show_all_tunnels;
     let collapse_standby =
-        snap.peer_filter.is_none() && !show_all_tunnels && report.tunnel_verdicts.len() > 8;
+        snap.peer_filter.is_none() && !show_all_tunnels && (is_discover || report.tunnel_verdicts.len() > 8);
     let mut hidden_standby = 0usize;
 
     md.push_str("## Tunnel Data-Plane Verdicts\n\n");
     md.push_str("| Tunnel (`Local -> Remote`) | Colors | Verdict | Recent Data (`TX / RX`) | Avg Pkt (`TX / RX`) | BFD (`State / Mult`) | Explanation |\n");
     md.push_str("| :--- | :--- | :--- | :---: | :---: | :---: | :--- |\n");
     for tv in &report.tunnel_verdicts {
-        if collapse_standby && tv.verdict == VerdictKind::StandbyBfdOnly {
+        let should_hide = if discover_compact {
+            !matches!(
+                tv.verdict,
+                VerdictKind::ActivePrimary | VerdictKind::BackupDataBleed | VerdictKind::DownOrDegraded
+            )
+        } else {
+            collapse_standby && tv.verdict == VerdictKind::StandbyBfdOnly
+        };
+        if should_hide {
             hidden_standby += 1;
             continue;
         }
@@ -287,10 +339,20 @@ pub fn render_markdown(report: &AnalysisReport, show_all_tunnels: bool) -> Strin
     }
 
     md.push_str("\n## OMP Route Selection\n\n");
+    let mut md_hidden_routes = 0usize;
     for re in &report.route_explanations {
+        if discover_compact && re.prefix != "0.0.0.0/0" {
+            md_hidden_routes += 1;
+            continue;
+        }
         md.push_str(&format!(
             "- **VPN `{}` `{}`:** Winner `{}` (`{}`) via local `{}` — {}\n",
             re.vpn_id, re.prefix, re.winning_color, re.winning_originator, re.local_egress_color, re.explanation
+        ));
+    }
+    if md_hidden_routes > 0 {
+        md.push_str(&format!(
+            "\n*Plus `{md_hidden_routes}` non-default service prefix(es) hidden in `--discover` (pass `--peer <ip>` or `--all-tunnels` to list).*\n"
         ));
     }
 

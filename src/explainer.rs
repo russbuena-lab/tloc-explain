@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::models::{
     AnalysisReport, DriftFinding, PeerSummary, RouteExplanation, RouterSnapshot, Severity,
-    TlocEntry, TunnelVerdict, VerdictKind,
+    TlocEntry, TunnelDiag, TunnelVerdict, VerdictKind,
 };
 use crate::parsers::is_route_chosen_resolved;
 
@@ -17,6 +17,16 @@ fn verdict_rank(v: &VerdictKind) -> u8 {
     }
 }
 
+fn route_peer_key(r: &crate::models::OmpRouteEntry) -> &str {
+    if !r.originator.is_empty() {
+        &r.originator
+    } else if !r.next_hop_tloc_ip.is_empty() {
+        &r.next_hop_tloc_ip
+    } else {
+        &r.from_peer
+    }
+}
+
 fn build_peer_summaries(snapshot: &RouterSnapshot) -> Vec<PeerSummary> {
     struct Accum {
         site_id: String,
@@ -24,9 +34,27 @@ fn build_peer_summaries(snapshot: &RouterSnapshot) -> Vec<PeerSummary> {
         tunnels_total: usize,
         recent_tx_pkts: u64,
         recent_rx_pkts: u64,
+        est_cum_data_pkts: u64,
+        cir_routes: usize,
+        backup_routes: usize,
+        is_default_route_winner: bool,
         colors: BTreeSet<String>,
         remote_ips: BTreeSet<String>,
     }
+
+    let default_acc = |site_id: String| Accum {
+        site_id,
+        tunnels_up: 0,
+        tunnels_total: 0,
+        recent_tx_pkts: 0,
+        recent_rx_pkts: 0,
+        est_cum_data_pkts: 0,
+        cir_routes: 0,
+        backup_routes: 0,
+        is_default_route_winner: false,
+        colors: BTreeSet::new(),
+        remote_ips: BTreeSet::new(),
+    };
 
     let mut by_peer: BTreeMap<String, Accum> = BTreeMap::new();
     for td in &snapshot.tunnels {
@@ -38,15 +66,7 @@ fn build_peer_summaries(snapshot: &RouterSnapshot) -> Vec<PeerSummary> {
         if key.is_empty() {
             continue;
         }
-        let acc = by_peer.entry(key).or_insert_with(|| Accum {
-            site_id: String::new(),
-            tunnels_up: 0,
-            tunnels_total: 0,
-            recent_tx_pkts: 0,
-            recent_rx_pkts: 0,
-            colors: BTreeSet::new(),
-            remote_ips: BTreeSet::new(),
-        });
+        let acc = by_peer.entry(key).or_insert_with(|| default_acc(String::new()));
         if acc.site_id.is_empty() && !td.remote_site_id.is_empty() {
             acc.site_id = td.remote_site_id.clone();
         }
@@ -56,6 +76,7 @@ fn build_peer_summaries(snapshot: &RouterSnapshot) -> Vec<PeerSummary> {
         }
         acc.recent_tx_pkts += td.recent_tx_data_pkts;
         acc.recent_rx_pkts += td.recent_rx_data_pkts;
+        acc.est_cum_data_pkts += td.est_cum_data_pkts;
         if !td.remote_color.is_empty() {
             acc.colors.insert(td.remote_color.clone());
         }
@@ -69,15 +90,9 @@ fn build_peer_summaries(snapshot: &RouterSnapshot) -> Vec<PeerSummary> {
             if rt.system_ip.is_empty() {
                 continue;
             }
-            let acc = by_peer.entry(rt.system_ip.clone()).or_insert_with(|| Accum {
-                site_id: rt.site_id.clone(),
-                tunnels_up: 0,
-                tunnels_total: 0,
-                recent_tx_pkts: 0,
-                recent_rx_pkts: 0,
-                colors: BTreeSet::new(),
-                remote_ips: BTreeSet::new(),
-            });
+            let acc = by_peer
+                .entry(rt.system_ip.clone())
+                .or_insert_with(|| default_acc(rt.site_id.clone()));
             if acc.site_id.is_empty() && !rt.site_id.is_empty() {
                 acc.site_id = rt.site_id.clone();
             }
@@ -87,6 +102,38 @@ fn build_peer_summaries(snapshot: &RouterSnapshot) -> Vec<PeerSummary> {
             if !rt.public_ip.is_empty() {
                 acc.remote_ips.insert(rt.public_ip.clone());
             }
+        }
+    }
+
+    let is_vsmart_mode = snapshot.source_mode == "ssh-vsmart";
+    let peer_filtered = snapshot.peer_filter.is_some();
+    for r in &snapshot.omp_routes {
+        if r.from_peer == "0.0.0.0" || r.is_redistributed {
+            continue;
+        }
+        let peer_key = route_peer_key(r);
+        if peer_key.is_empty() {
+            continue;
+        }
+        let acc = if peer_filtered {
+            match by_peer.get_mut(peer_key) {
+                Some(a) => a,
+                None => continue,
+            }
+        } else {
+            by_peer
+                .entry(peer_key.to_string())
+                .or_insert_with(|| default_acc(r.site_id.clone()))
+        };
+        let is_winner =
+            r.is_chosen_installed || (is_vsmart_mode && is_route_chosen_resolved(&r.status));
+        if is_winner {
+            acc.cir_routes += 1;
+            if r.prefix == "0.0.0.0/0" {
+                acc.is_default_route_winner = true;
+            }
+        } else {
+            acc.backup_routes += 1;
         }
     }
 
@@ -109,6 +156,10 @@ fn build_peer_summaries(snapshot: &RouterSnapshot) -> Vec<PeerSummary> {
                 tunnels_total: acc.tunnels_total,
                 recent_tx_pkts: acc.recent_tx_pkts,
                 recent_rx_pkts: acc.recent_rx_pkts,
+                est_cum_data_pkts: acc.est_cum_data_pkts,
+                cir_routes: acc.cir_routes,
+                backup_routes: acc.backup_routes,
+                is_default_route_winner: acc.is_default_route_winner,
                 colors: acc.colors.into_iter().collect(),
                 remote_ips: acc.remote_ips.into_iter().collect(),
             }
@@ -116,17 +167,54 @@ fn build_peer_summaries(snapshot: &RouterSnapshot) -> Vec<PeerSummary> {
         .collect();
 
     out.sort_by(|a, b| {
-        Reverse(a.recent_tx_pkts + a.recent_rx_pkts)
-            .cmp(&Reverse(b.recent_tx_pkts + b.recent_rx_pkts))
+        Reverse(a.is_default_route_winner)
+            .cmp(&Reverse(b.is_default_route_winner))
+            .then_with(|| Reverse(a.cir_routes).cmp(&Reverse(b.cir_routes)))
+            .then_with(|| {
+                Reverse(a.recent_tx_pkts + a.recent_rx_pkts)
+                    .cmp(&Reverse(b.recent_tx_pkts + b.recent_rx_pkts))
+            })
+            .then_with(|| Reverse(a.est_cum_data_pkts).cmp(&Reverse(b.est_cum_data_pkts)))
             .then_with(|| Reverse(a.tunnels_up).cmp(&Reverse(b.tunnels_up)))
             .then_with(|| a.system_ip.cmp(&b.system_ip))
     });
     out
 }
 
+fn resolve_local_egress<'a>(
+    tunnels: &[TunnelDiag],
+    local_tlocs: &'a [TlocEntry],
+    best_global: Option<&'a TlocEntry>,
+    remote_sys: &str,
+    remote_color: &str,
+) -> (String, String, Option<u32>) {
+    let matched_local = tunnels
+        .iter()
+        .filter(|t| {
+            (t.bfd_state.is_empty() || t.bfd_state == "up")
+                && t.remote_system_ip == remote_sys
+                && (remote_color.is_empty() || t.remote_color == remote_color)
+        })
+        .filter_map(|t| {
+            local_tlocs
+                .iter()
+                .find(|l| (!l.color.is_empty() && l.color == t.local_color) || l.public_ip == t.local_ip)
+        })
+        .max_by_key(|l| l.preference)
+        .or(best_global);
+
+    match matched_local {
+        Some(lt) => (lt.color.clone(), lt.public_ip.clone(), Some(lt.preference)),
+        None => ("unknown".to_string(), String::new(), None),
+    }
+}
+
 /// Evaluates a `RouterSnapshot` and generates plain-English tunnel verdicts, route explanations,
 /// and automated drift/risk findings.
 pub fn explain_snapshot(mut snapshot: RouterSnapshot) -> AnalysisReport {
+    let all_remote_tlocs = snapshot.remote_tlocs.clone();
+    let all_tunnels = snapshot.tunnels.clone();
+
     if let Some(filter) = snapshot.peer_filter.clone() {
         let target_sys = snapshot
             .tunnels
@@ -156,28 +244,55 @@ pub fn explain_snapshot(mut snapshot: RouterSnapshot) -> AnalysisReport {
         snapshot.remote_tlocs.retain(|rt| {
             rt.system_ip == target_sys || rt.public_ip == filter || rt.private_ip == filter
         });
-        snapshot.omp_routes.retain(|r| {
-            r.originator == target_sys
-                || r.next_hop_tloc_ip == target_sys
-                || r.from_peer == target_sys
-        });
+
+        // Keep competing C,I,R winners for any (vpn_id, prefix) where the focused peer appears
+        // so Section 4 shows why the peer is standby if another hub/peer owns the active route.
+        let matching_prefixes: BTreeSet<(String, String)> = snapshot
+            .omp_routes
+            .iter()
+            .filter(|r| {
+                r.originator == target_sys
+                    || r.next_hop_tloc_ip == target_sys
+                    || r.from_peer == target_sys
+            })
+            .map(|r| (r.vpn_id.clone(), r.prefix.clone()))
+            .collect();
+        snapshot
+            .omp_routes
+            .retain(|r| matching_prefixes.contains(&(r.vpn_id.clone(), r.prefix.clone())));
     }
 
+    let is_vsmart_mode = snapshot.source_mode == "ssh-vsmart";
     let peer_summaries = build_peer_summaries(&snapshot);
+
+    // Map each (remote_system_ip, remote_color) to (cir_route_count, wins_default_route).
+    let mut cir_by_target: BTreeMap<(String, String), (usize, bool)> = BTreeMap::new();
+    let mut cir_peers: BTreeSet<String> = BTreeSet::new();
+    for r in &snapshot.omp_routes {
+        if r.from_peer == "0.0.0.0" || r.is_redistributed {
+            continue;
+        }
+        let is_winner =
+            r.is_chosen_installed || (is_vsmart_mode && is_route_chosen_resolved(&r.status));
+        if is_winner {
+            let p_sys = route_peer_key(r).to_string();
+            cir_peers.insert(p_sys.clone());
+            let entry = cir_by_target
+                .entry((p_sys, r.color.clone()))
+                .or_insert((0, false));
+            entry.0 += 1;
+            if r.prefix == "0.0.0.0/0" {
+                entry.1 = true;
+            }
+        }
+    }
+
     let up_local_colors: BTreeSet<String> = snapshot
         .tunnels
         .iter()
         .filter(|t| t.bfd_state.is_empty() || t.bfd_state == "up")
         .map(|t| t.local_color.clone())
         .collect();
-
-    let max_local_pref = snapshot
-        .local_tlocs
-        .iter()
-        .filter(|l| up_local_colors.is_empty() || up_local_colors.contains(&l.color))
-        .map(|l| l.preference)
-        .max()
-        .unwrap_or(0);
 
     let best_local_tloc = snapshot
         .local_tlocs
@@ -207,11 +322,44 @@ pub fn explain_snapshot(mut snapshot: RouterSnapshot) -> AnalysisReport {
 
         let lp = local_pref.unwrap_or(0);
         let rp = remote_pref.unwrap_or(0);
+        let max_local_pref_for_target = snapshot
+            .tunnels
+            .iter()
+            .filter(|other| {
+                (other.bfd_state.is_empty() || other.bfd_state == "up")
+                    && other.remote_system_ip == td.remote_system_ip
+                    && other.remote_color == td.remote_color
+            })
+            .filter_map(|other| {
+                lookup_tloc_pref(&snapshot.local_tlocs, None, &other.local_color, &other.local_ip)
+            })
+            .max()
+            .unwrap_or(lp);
+
+        let (cir_cnt, wins_default) = cir_by_target
+            .get(&(td.remote_system_ip.clone(), td.remote_color.clone()))
+            .copied()
+            .unwrap_or((0, false));
+        let peer_has_any_cir = cir_peers.contains(&td.remote_system_ip);
+        let remote_is_winner = if peer_has_any_cir {
+            cir_cnt > 0
+        } else {
+            rp >= max_remote_pref
+        };
         let is_preferred_pair =
-            (snapshot.local_tlocs.len() <= 1 || lp >= max_local_pref) && rp >= max_remote_pref;
+            (snapshot.local_tlocs.len() <= 1 || lp >= max_local_pref_for_target) && remote_is_winner;
 
         let recent_total = td.recent_tx_data_pkts + td.recent_rx_data_pkts;
         let is_down = !td.bfd_state.is_empty() && td.bfd_state != "up";
+        let route_note = if cir_cnt > 0 {
+            if wins_default {
+                format!("; OMP C,I,R winner for {cir_cnt} route(s) including 0.0.0.0/0")
+            } else {
+                format!("; OMP C,I,R winner for {cir_cnt} route(s)")
+            }
+        } else {
+            String::new()
+        };
 
         let (verdict, reason) = if is_down {
             (
@@ -230,17 +378,16 @@ pub fn explain_snapshot(mut snapshot: RouterSnapshot) -> AnalysisReport {
                 (
                     VerdictKind::ActivePrimary,
                     format!(
-                        "Actively forwarding user traffic ({} TX / {} RX data pkts in last 3m; avg {:.1}B TX / {:.1}B RX). Selected because local {} Pref={} (max={}) and remote {} Pref={} (max={}).",
+                        "Actively forwarding user traffic ({} TX / {} RX data pkts in last 3m; avg {:.1}B TX / {:.1}B RX). Selected because local {} Pref={} (max={}){route_note} (remote {} Pref={}).",
                         td.recent_tx_data_pkts,
                         td.recent_rx_data_pkts,
                         td.avg_tx_pkt_bytes,
                         td.avg_rx_pkt_bytes,
                         td.local_color,
                         lp,
-                        max_local_pref,
+                        max_local_pref_for_target,
                         td.remote_color,
-                        rp,
-                        max_remote_pref
+                        rp
                     ),
                 )
             } else {
@@ -252,21 +399,13 @@ pub fn explain_snapshot(mut snapshot: RouterSnapshot) -> AnalysisReport {
                         td.recent_rx_data_pkts,
                         td.local_color,
                         lp,
-                        max_local_pref,
+                        max_local_pref_for_target,
                         td.remote_color,
                         rp,
                         max_remote_pref
                     ),
                 )
             }
-        } else if td.has_app_route && recent_total == 0 && td.est_cum_data_pkts > 20 {
-            (
-                VerdictKind::HistoricalFailoverIdle,
-                format!(
-                    "Currently 0 recent user packets in app-route stats (BFD-only right now), but cumulative tunnel stats show ~{} historical data packets (avg {:.1}B TX / {:.1}B RX) from earlier failover or preference changes.",
-                    td.est_cum_data_pkts, td.avg_tx_pkt_bytes, td.avg_rx_pkt_bytes
-                ),
-            )
         } else if !td.has_app_route && td.est_cum_data_pkts > 20 {
             if is_preferred_pair {
                 active_primary_tunnels.push(format!(
@@ -276,7 +415,7 @@ pub fn explain_snapshot(mut snapshot: RouterSnapshot) -> AnalysisReport {
                 (
                     VerdictKind::ActivePrimary,
                     format!(
-                        "Highest-preference TLOC pair (local {} Pref={}, remote {} Pref={}) with ~{} cumulative data packets above BFD baseline (avg {:.1}B TX / {:.1}B RX).",
+                        "Highest-preference TLOC pair (local {} Pref={}, remote {} Pref={}{route_note}) with ~{} cumulative data packets above BFD baseline (avg {:.1}B TX / {:.1}B RX).",
                         td.local_color, lp, td.remote_color, rp, td.est_cum_data_pkts, td.avg_tx_pkt_bytes, td.avg_rx_pkt_bytes
                     ),
                 )
@@ -289,6 +428,38 @@ pub fn explain_snapshot(mut snapshot: RouterSnapshot) -> AnalysisReport {
                     ),
                 )
             }
+        } else if is_preferred_pair && cir_cnt > 0 {
+            active_primary_tunnels.push(format!(
+                "{} ({}) -> {} ({})",
+                td.local_color, td.local_ip, td.remote_color, td.remote_ip
+            ));
+            let omp_desc = if wins_default {
+                format!("OMP C,I,R winner for {cir_cnt} route(s) including 0.0.0.0/0")
+            } else {
+                format!("OMP C,I,R winner for {cir_cnt} route(s)")
+            };
+            (
+                VerdictKind::ActivePrimary,
+                format!(
+                    "Primary OMP forwarding tunnel ({omp_desc}; local {} Pref={} [max={}], remote {} Pref={}). Current payload counters show {} TX / {} RX (3m) and ~{} cumulative data pkts.",
+                    td.local_color,
+                    lp,
+                    max_local_pref_for_target,
+                    td.remote_color,
+                    rp,
+                    td.recent_tx_data_pkts,
+                    td.recent_rx_data_pkts,
+                    td.est_cum_data_pkts
+                ),
+            )
+        } else if td.has_app_route && recent_total == 0 && td.est_cum_data_pkts > 20 {
+            (
+                VerdictKind::HistoricalFailoverIdle,
+                format!(
+                    "Currently 0 recent user packets in app-route stats (BFD-only right now), but cumulative tunnel stats show ~{} historical data packets (avg {:.1}B TX / {:.1}B RX) from earlier failover or preference changes.",
+                    td.est_cum_data_pkts, td.avg_tx_pkt_bytes, td.avg_rx_pkt_bytes
+                ),
+            )
         } else {
             (
                 VerdictKind::StandbyBfdOnly,
@@ -336,7 +507,6 @@ pub fn explain_snapshot(mut snapshot: RouterSnapshot) -> AnalysisReport {
             .push(r.clone());
     }
 
-    let is_vsmart_mode = snapshot.source_mode == "ssh-vsmart";
     let mut route_explanations = Vec::new();
     for ((vpn_id, prefix), entries) in route_groups {
         let winners: Vec<_> = entries
@@ -367,7 +537,7 @@ pub fn explain_snapshot(mut snapshot: RouterSnapshot) -> AnalysisReport {
         let backup_paths: Vec<String> = backups
             .iter()
             .map(|b| {
-                let b_pref = lookup_tloc_pref(&snapshot.remote_tlocs, Some(&b.originator), &b.color, "");
+                let b_pref = lookup_tloc_pref(&all_remote_tlocs, Some(&b.originator), &b.color, "");
                 match b_pref {
                     Some(p) => format!("{} via {} (Pref {}, status={})", b.color, b.originator, p, b.status),
                     None => format!("{} via {} (status={})", b.color, b.originator, b.status),
@@ -375,14 +545,23 @@ pub fn explain_snapshot(mut snapshot: RouterSnapshot) -> AnalysisReport {
             })
             .collect();
 
-        let (local_egress_color, local_egress_ip, local_pref_val) = match &best_local_tloc {
-            Some(lt) => (lt.color.clone(), lt.public_ip.clone(), Some(lt.preference)),
-            None => ("unknown".to_string(), String::new(), None),
+        let (local_egress_color, local_egress_ip, local_pref_val) = match winners.first() {
+            Some(w) => resolve_local_egress(
+                &all_tunnels,
+                &snapshot.local_tlocs,
+                best_local_tloc.as_ref(),
+                &w.originator,
+                &w.color,
+            ),
+            None => match &best_local_tloc {
+                Some(lt) => (lt.color.clone(), lt.public_ip.clone(), Some(lt.preference)),
+                None => ("unknown".to_string(), String::new(), None),
+            },
         };
 
         let win_remote_pref = winners
             .first()
-            .and_then(|w| lookup_tloc_pref(&snapshot.remote_tlocs, Some(&w.originator), &w.color, ""));
+            .and_then(|w| lookup_tloc_pref(&all_remote_tlocs, Some(&w.originator), &w.color, ""));
 
         let explanation = match (winners.first(), win_remote_pref, local_pref_val) {
             (Some(w), Some(rp), Some(lp)) => format!(
@@ -395,9 +574,10 @@ pub fn explain_snapshot(mut snapshot: RouterSnapshot) -> AnalysisReport {
                 backups.len()
             ),
             (Some(w), _, _) => format!(
-                "Installed via remote TLOC '{}' (peer {}); {} standby path(s) held as R.",
+                "Installed via remote TLOC '{}' (peer {}) via local egress '{}'; {} standby path(s) held as R.",
                 w.color,
                 w.originator,
+                local_egress_color,
                 backups.len()
             ),
             (None, _, _) => "No C,I,R installed path found for this prefix.".to_string(),
@@ -1119,5 +1299,61 @@ app-route statistics 10.10.1.1 172.16.30.2 ipsec 12346 12346
         assert_eq!(filtered.peer_summaries[0].site_id, "300");
         assert_eq!(filtered.route_explanations.len(), 1);
         assert_eq!(filtered.route_explanations[0].vpn_id, "200");
+    }
+
+    #[test]
+    fn marks_cir_default_route_winner_active_in_discover_and_retains_winner_for_backup_peer() {
+        let capture = r#"
+spoke1#show vrf
+  Name                             Default RD            Protocols   Interfaces
+  10                               <not set>             ipv4        Gi3
+spoke1#show sdwan running-config sdwan
+sdwan
+ interface GigabitEthernet1
+  tunnel-interface
+   encapsulation ipsec preference 200 weight 1
+   color biz-internet
+  exit
+ exit
+ interface GigabitEthernet2
+  tunnel-interface
+   encapsulation ipsec preference 100 weight 1
+   color mpls
+  exit
+ exit
+!
+spoke1#show sdwan bfd sessions
+SYSTEM IP        SITE ID     STATE       SOURCE TLOC      REMOTE TLOC                                      DST PUBLIC                      DST PUBLIC         DETECT      TX
+10.255.1.1       10          up          biz-internet     biz-internet     10.10.1.11                                      172.16.1.1                                      12346       ipsec  3           1000           0:01:00:00      0
+10.255.1.2       20          up          mpls             mpls             10.10.2.11                                      172.16.2.1                                      12346       ipsec  3           1000           0:01:00:00      0
+spoke1#show sdwan omp routes
+TENANT    VPN    PREFIX              FROM PEER        ID     LABEL    STATUS    TYPE       TLOC IP          COLOR            ENCAP  PREFERENCE  NUMBER      REGION ID   REGION PATH
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+0         10     0.0.0.0/0           10.255.0.3       1      1001     C,I,R     installed  10.255.1.1       biz-internet     ipsec  -           None        None        -
+                                     10.255.0.3       2      1002     R         installed  10.255.1.2       mpls             ipsec  -           None        None        -
+"#;
+        // 1. Discover mode without app-route stats identifies 10.255.1.1 as 0.0.0.0/0 winner & ActivePrimary
+        let snap_disc = build_snapshot_from_text("spoke1", "10.255.10.1", "101", "ssh-discover", capture);
+        assert_eq!(snap_disc.local_tlocs[0].public_ip, "10.10.1.11");
+        let rep_disc = explain_snapshot(snap_disc);
+        assert_eq!(rep_disc.active_primary_tunnels.len(), 1);
+        assert!(rep_disc.active_primary_tunnels[0].contains("172.16.1.1"));
+        assert_eq!(rep_disc.peer_summaries[0].system_ip, "10.255.1.1");
+        assert!(rep_disc.peer_summaries[0].is_default_route_winner);
+        assert_eq!(rep_disc.peer_summaries[0].cir_routes, 1);
+        assert_eq!(rep_disc.peer_summaries[1].system_ip, "10.255.1.2");
+        assert!(!rep_disc.peer_summaries[1].is_default_route_winner);
+        assert_eq!(rep_disc.peer_summaries[1].backup_routes, 1);
+
+        // 2. Focusing --peer 10.255.1.2 (backup hub) keeps competing C,I,R winner 10.255.1.1 in Section 4
+        let mut snap_backup = build_snapshot_from_text("spoke1", "10.255.10.1", "101", "ssh", capture);
+        snap_backup.peer_filter = Some("10.255.1.2".to_string());
+        let rep_backup = explain_snapshot(snap_backup);
+        assert_eq!(rep_backup.tunnel_verdicts.len(), 1);
+        assert_eq!(rep_backup.tunnel_verdicts[0].verdict, VerdictKind::StandbyBfdOnly);
+        assert_eq!(rep_backup.route_explanations.len(), 1);
+        assert_eq!(rep_backup.route_explanations[0].winning_originator, "10.255.1.1");
+        assert_eq!(rep_backup.route_explanations[0].backup_paths.len(), 1);
+        assert!(rep_backup.route_explanations[0].backup_paths[0].contains("10.255.1.2"));
     }
 }

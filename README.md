@@ -20,7 +20,7 @@ Standalone, zero-warning Rust CLI (`x86_64-unknown-linux-musl` static binary) th
 - **Zero External Build or Runtime Crates Needed:**
   - Pure-Rust dependency tree (`serde`, `serde_json`, `regex` — zero `ring`, zero `cc`, zero OpenSSL/tokio C-toolchain requirements). All 20 crates are **vendored right in [`vendor/`](vendor/)** with [`.cargo/config.toml`](.cargo/config.toml), alongside a pre-built static [`tloc-explain`](tloc-explain) binary, [`install.sh`](install.sh), and a self-contained Debian package [`dist/tloc-explain_0.1.0_amd64.deb`](dist/tloc-explain_0.1.0_amd64.deb).
 - **Direct Router First (No vManage Required):**
-  - **Direct Router SSH (default):** `tloc-explain <router-ip> -u <user>` connects straight to a `cEdge` (or `--vsmart`) via native OpenSSH, auto-discovers all Service VPNs via `show vrf` + `show sdwan omp routes` (`--vpn all` default, or pin a specific VPN with `--vpn <id>`), continuously drains stdout/stderr pipes, steps command-by-command after each router prompt (`120s` default timeout, configurable via `--timeout <secs>`), auto-advances `--More--`, and writes a per-step diagnostic log to `~/.cache/tloc-explain/tloc-explain-debug.log` (use `-v` / `--debug` for live step timing). Supports fast `--discover` (~3s Service VPN & peer list), `--peer <sys-ip|wan-ip>` focusing (including router-side `app-route stats remote-system-ip` narrowing), `--all-tunnels`, SSH keys (`-i <keyfile>`), hidden interactive `/dev/tty` password prompting (`stty -echo`, `-P`/`--ask-pass`), or `TLOC_SSH_PASS` / `ROUTER_SSH_PASS` / `--password-env <VAR>`. Ephemeral `0700` `SSH_ASKPASS` runs in `~/.cache/tloc-explain/` (safe on DISA STIG `/tmp noexec` hosts).
+  - **Direct Router SSH (default):** `tloc-explain <router-ip> -u <user>` connects straight to a `cEdge` (or `--vsmart`) via native OpenSSH, auto-discovers all Service VPNs via `show vrf` + `show sdwan omp routes` (`--vpn all` default, or pin a specific VPN with `--vpn <id>`), continuously drains stdout/stderr pipes, steps command-by-command after each router prompt (`120s` default timeout, configurable via `--timeout <secs>`), auto-advances `--More--`, and writes a per-step diagnostic log to `~/.cache/tloc-explain/tloc-explain-debug.log` (use `-v` / `--debug` for live step timing). Supports compact `--discover` (skips heavy `omp tlocs` / `app-route stats` while showing active forwarding tunnels, `0.0.0.0/0` winner, Service VPNs, and `Remote Peers Summary`), `--peer <sys-ip|wan-ip>` focusing (including router-side `app-route stats remote-system-ip` narrowing), `--all-tunnels`, SSH keys (`-i <keyfile>`), hidden interactive `/dev/tty` password prompting (`stty -echo`, `-P`/`--ask-pass`), or `TLOC_SSH_PASS` / `ROUTER_SSH_PASS` / `--password-env <VAR>`. Ephemeral `0700` `SSH_ASKPASS` runs in `~/.cache/tloc-explain/` (safe on DISA STIG `/tmp noexec` hosts).
   - **`file`:** Parses offline CLI captures cleanly.
   - **`vmanage` (optional):** Queries `vManage` real-time APIs concurrently (`std::thread::scope` + native `curl`, no `reqwest`/`rustls` crates required) across one device or `--device all`.
 
@@ -43,7 +43,7 @@ sudo dpkg -i dist/tloc-explain_0.1.0_amd64.deb
 ## Usage Examples
 
 ```bash
-# 1. Fast ~3s discovery on a busy hub/branch (lists Service VPNs and all peers)
+# 1. Compact discovery on a busy hub/branch (identifies active peer, 0.0.0.0/0 winner & VPNs)
 tloc-explain 10.10.1.21 -u admin --discover
 
 # 2. Focus full analysis & router-side app-route stats on ONE peer (System IP or WAN IP)

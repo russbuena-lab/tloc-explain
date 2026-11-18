@@ -222,6 +222,10 @@ pub struct PeerSummary {
     pub tunnels_total: usize,
     pub recent_tx_pkts: u64,
     pub recent_rx_pkts: u64,
+    pub est_cum_data_pkts: u64,
+    pub cir_routes: usize,
+    pub backup_routes: usize,
+    pub is_default_route_winner: bool,
     pub colors: Vec<String>,
     pub remote_ips: Vec<String>,
 }

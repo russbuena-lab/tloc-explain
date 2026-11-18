@@ -765,6 +765,18 @@ pub fn build_snapshot_from_text(
 
     let tunnels = merge_tunnel_diags(bfd_list, tun_stats, app_stats);
 
+    // Backfill local_tlocs public_ip from BFD/tunnel source IPs when `show sdwan omp tlocs` was skipped (e.g. --discover)
+    for lt in &mut local_tlocs {
+        if lt.public_ip.is_empty() {
+            if let Some(td) = tunnels.iter().find(|td| td.local_color == lt.color && !td.local_ip.is_empty()) {
+                lt.public_ip = td.local_ip.clone();
+                if lt.private_ip.is_empty() {
+                    lt.private_ip = td.local_ip.clone();
+                }
+            }
+        }
+    }
+
     // Infer local_tlocs from tunnel local_ips if neither running-config nor omp tlocs populated them
     if local_tlocs.is_empty() {
         let mut seen = BTreeMap::new();

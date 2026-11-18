@@ -616,19 +616,25 @@ pub fn run_ssh_commands(target: &SshTarget<'_>, commands: &[String]) -> Result<S
 /// Collects a full `RouterSnapshot` from either an IOS-XE `cEdge` router or a `vSmart` controller over SSH.
 pub fn collect_via_ssh(target: &SshTarget<'_>) -> Result<RouterSnapshot, String> {
     let all_vpns = target.vpn_id.is_empty() || target.vpn_id.eq_ignore_ascii_case("all");
+    let routes_cmd_edge = if all_vpns {
+        "show sdwan omp routes".to_string()
+    } else {
+        format!("show sdwan omp routes vpn {}", target.vpn_id)
+    };
+    let routes_cmd_vsmart = if all_vpns {
+        "show omp routes".to_string()
+    } else {
+        format!("show omp routes vpn {}", target.vpn_id)
+    };
+
     let mut cmds: Vec<String> = if target.is_vsmart {
         if target.discover {
-            vec!["paginate false".to_string(), "show omp tlocs".to_string()]
+            vec!["paginate false".to_string(), "show omp tlocs".to_string(), routes_cmd_vsmart]
         } else {
-            let routes_cmd = if all_vpns {
-                "show omp routes".to_string()
-            } else {
-                format!("show omp routes vpn {}", target.vpn_id)
-            };
             vec![
                 "paginate false".to_string(),
                 "show omp tlocs".to_string(),
-                routes_cmd,
+                routes_cmd_vsmart,
                 "show running-config apply-policy".to_string(),
             ]
         }
@@ -639,13 +645,10 @@ pub fn collect_via_ssh(target: &SshTarget<'_>) -> Result<RouterSnapshot, String>
             "show sdwan control local-properties".to_string(),
             "show sdwan running-config sdwan".to_string(),
             "show sdwan bfd sessions".to_string(),
+            routes_cmd_edge,
+            "show sdwan tunnel statistics".to_string(),
         ]
     } else {
-        let routes_cmd = if all_vpns {
-            "show sdwan omp routes".to_string()
-        } else {
-            format!("show sdwan omp routes vpn {}", target.vpn_id)
-        };
         vec![
             "terminal length 0".to_string(),
             "show vrf".to_string(),
@@ -653,7 +656,7 @@ pub fn collect_via_ssh(target: &SshTarget<'_>) -> Result<RouterSnapshot, String>
             "show sdwan running-config sdwan".to_string(),
             "show sdwan bfd sessions".to_string(),
             "show sdwan omp tlocs".to_string(),
-            routes_cmd,
+            routes_cmd_edge,
             "show sdwan tunnel statistics".to_string(),
             "show sdwan app-route stats".to_string(),
         ]
