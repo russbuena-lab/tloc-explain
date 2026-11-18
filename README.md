@@ -20,7 +20,7 @@ Standalone, zero-warning Rust CLI (`x86_64-unknown-linux-musl` static binary) th
 - **Zero External Build or Runtime Crates Needed:**
   - Pure-Rust dependency tree (`serde`, `serde_json`, `regex` — zero `ring`, zero `cc`, zero OpenSSL/tokio C-toolchain requirements). All 20 crates are **vendored right in [`vendor/`](vendor/)** with [`.cargo/config.toml`](.cargo/config.toml), alongside a pre-built static [`tloc-explain`](tloc-explain) binary, [`install.sh`](install.sh), and a self-contained Debian package [`dist/tloc-explain_0.1.0_amd64.deb`](dist/tloc-explain_0.1.0_amd64.deb).
 - **Direct Router First (No vManage Required):**
-  - **Direct Router SSH (default):** `tloc-explain <router-ip> -u <user>` connects straight to a `cEdge` (or `--vsmart`) via native OpenSSH, continuously drains stdout/stderr pipes, steps command-by-command after each router prompt (`120s` default timeout, configurable via `--timeout <secs>`), auto-advances `--More--`, and writes a per-step diagnostic log to `~/.cache/tloc-explain/tloc-explain-debug.log` (use `-v` / `--debug` for live step timing). Supports SSH keys (`-i <keyfile>`), hidden interactive password prompt on `/dev/tty` (`stty -echo`, automatic when no env password is set or explicit `-P` / `--ask-pass`), or `TLOC_SSH_PASS` / `ROUTER_SSH_PASS` / `--password-env <VAR>`. Ephemeral `0700` `SSH_ASKPASS` runs in `~/.cache/tloc-explain/` (safe on DISA STIG `/tmp noexec` hosts).
+  - **Direct Router SSH (default):** `tloc-explain <router-ip> -u <user>` connects straight to a `cEdge` (or `--vsmart`) via native OpenSSH, auto-discovers all Service VPNs via `show vrf` + `show sdwan omp routes` (`--vpn all` default, or pin a specific VPN with `--vpn <id>`), continuously drains stdout/stderr pipes, steps command-by-command after each router prompt (`120s` default timeout, configurable via `--timeout <secs>`), auto-advances `--More--`, and writes a per-step diagnostic log to `~/.cache/tloc-explain/tloc-explain-debug.log` (use `-v` / `--debug` for live step timing). Supports fast `--discover` (~3s Service VPN & peer list), `--peer <sys-ip|wan-ip>` focusing (including router-side `app-route stats remote-system-ip` narrowing), `--all-tunnels`, SSH keys (`-i <keyfile>`), hidden interactive `/dev/tty` password prompting (`stty -echo`, `-P`/`--ask-pass`), or `TLOC_SSH_PASS` / `ROUTER_SSH_PASS` / `--password-env <VAR>`. Ephemeral `0700` `SSH_ASKPASS` runs in `~/.cache/tloc-explain/` (safe on DISA STIG `/tmp noexec` hosts).
   - **`file`:** Parses offline CLI captures cleanly.
   - **`vmanage` (optional):** Queries `vManage` real-time APIs concurrently (`std::thread::scope` + native `curl`, no `reqwest`/`rustls` crates required) across one device or `--device all`.
 
@@ -43,15 +43,22 @@ sudo dpkg -i dist/tloc-explain_0.1.0_amd64.deb
 ## Usage Examples
 
 ```bash
-# Run directly on a cEdge router (interactive hidden password prompt)
-tloc-explain 10.10.1.21 -u admin
-tloc-explain 10.10.1.21 -u admin -P --vpn 1000
+# 1. Fast ~3s discovery on a busy hub/branch (lists Service VPNs and all peers)
+tloc-explain 10.10.1.21 -u admin --discover
 
-# Authenticate with an SSH private key
+# 2. Focus full analysis & router-side app-route stats on ONE peer (System IP or WAN IP)
+tloc-explain 10.10.1.21 -u admin --peer 10.255.1.1
+
+# 3. Auto-discover all Service VPNs or filter to a specific Service VPN ID
+tloc-explain 10.10.1.21 -u admin
+tloc-explain 10.10.1.21 -u admin --peer 10.255.1.1 --vpn 10
+
+# Authenticate with an SSH private key or force hidden password prompt
 tloc-explain 10.10.1.21 -u admin -i ~/.ssh/id_ed25519
+tloc-explain 10.10.1.21 -u admin -P --all-tunnels -v
 
 # Export Markdown or inspect a vSmart controller
-tloc-explain 172.16.1.21 -u admin --vpn 1000 --markdown /tmp/border1.md
+tloc-explain 172.16.1.21 -u admin --peer 10.255.1.11 --markdown /tmp/border1.md
 tloc-explain 172.16.1.12 -u admin --vsmart
 
 # Analyze an offline CLI capture file

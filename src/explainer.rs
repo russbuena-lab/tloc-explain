@@ -1,14 +1,169 @@
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::models::{
-    AnalysisReport, DriftFinding, RouteExplanation, RouterSnapshot, Severity, TlocEntry,
-    TunnelVerdict, VerdictKind,
+    AnalysisReport, DriftFinding, PeerSummary, RouteExplanation, RouterSnapshot, Severity,
+    TlocEntry, TunnelVerdict, VerdictKind,
 };
 use crate::parsers::is_route_chosen_resolved;
 
+fn verdict_rank(v: &VerdictKind) -> u8 {
+    match v {
+        VerdictKind::BackupDataBleed => 0,
+        VerdictKind::ActivePrimary => 1,
+        VerdictKind::DownOrDegraded => 2,
+        VerdictKind::HistoricalFailoverIdle => 3,
+        VerdictKind::StandbyBfdOnly => 4,
+    }
+}
+
+fn build_peer_summaries(snapshot: &RouterSnapshot) -> Vec<PeerSummary> {
+    struct Accum {
+        site_id: String,
+        tunnels_up: usize,
+        tunnels_total: usize,
+        recent_tx_pkts: u64,
+        recent_rx_pkts: u64,
+        colors: BTreeSet<String>,
+        remote_ips: BTreeSet<String>,
+    }
+
+    let mut by_peer: BTreeMap<String, Accum> = BTreeMap::new();
+    for td in &snapshot.tunnels {
+        let key = if td.remote_system_ip.is_empty() {
+            td.remote_ip.clone()
+        } else {
+            td.remote_system_ip.clone()
+        };
+        if key.is_empty() {
+            continue;
+        }
+        let acc = by_peer.entry(key).or_insert_with(|| Accum {
+            site_id: String::new(),
+            tunnels_up: 0,
+            tunnels_total: 0,
+            recent_tx_pkts: 0,
+            recent_rx_pkts: 0,
+            colors: BTreeSet::new(),
+            remote_ips: BTreeSet::new(),
+        });
+        if acc.site_id.is_empty() && !td.remote_site_id.is_empty() {
+            acc.site_id = td.remote_site_id.clone();
+        }
+        acc.tunnels_total += 1;
+        if td.bfd_state == "up" {
+            acc.tunnels_up += 1;
+        }
+        acc.recent_tx_pkts += td.recent_tx_data_pkts;
+        acc.recent_rx_pkts += td.recent_rx_data_pkts;
+        if !td.remote_color.is_empty() {
+            acc.colors.insert(td.remote_color.clone());
+        }
+        if !td.remote_ip.is_empty() {
+            acc.remote_ips.insert(td.remote_ip.clone());
+        }
+    }
+
+    if by_peer.is_empty() {
+        for rt in &snapshot.remote_tlocs {
+            if rt.system_ip.is_empty() {
+                continue;
+            }
+            let acc = by_peer.entry(rt.system_ip.clone()).or_insert_with(|| Accum {
+                site_id: rt.site_id.clone(),
+                tunnels_up: 0,
+                tunnels_total: 0,
+                recent_tx_pkts: 0,
+                recent_rx_pkts: 0,
+                colors: BTreeSet::new(),
+                remote_ips: BTreeSet::new(),
+            });
+            if acc.site_id.is_empty() && !rt.site_id.is_empty() {
+                acc.site_id = rt.site_id.clone();
+            }
+            if !rt.color.is_empty() {
+                acc.colors.insert(rt.color.clone());
+            }
+            if !rt.public_ip.is_empty() {
+                acc.remote_ips.insert(rt.public_ip.clone());
+            }
+        }
+    }
+
+    let mut out: Vec<PeerSummary> = by_peer
+        .into_iter()
+        .map(|(system_ip, mut acc)| {
+            if acc.site_id.is_empty() {
+                if let Some(rt) = snapshot
+                    .remote_tlocs
+                    .iter()
+                    .find(|t| t.system_ip == system_ip && !t.site_id.is_empty())
+                {
+                    acc.site_id = rt.site_id.clone();
+                }
+            }
+            PeerSummary {
+                system_ip,
+                site_id: acc.site_id,
+                tunnels_up: acc.tunnels_up,
+                tunnels_total: acc.tunnels_total,
+                recent_tx_pkts: acc.recent_tx_pkts,
+                recent_rx_pkts: acc.recent_rx_pkts,
+                colors: acc.colors.into_iter().collect(),
+                remote_ips: acc.remote_ips.into_iter().collect(),
+            }
+        })
+        .collect();
+
+    out.sort_by(|a, b| {
+        Reverse(a.recent_tx_pkts + a.recent_rx_pkts)
+            .cmp(&Reverse(b.recent_tx_pkts + b.recent_rx_pkts))
+            .then_with(|| Reverse(a.tunnels_up).cmp(&Reverse(b.tunnels_up)))
+            .then_with(|| a.system_ip.cmp(&b.system_ip))
+    });
+    out
+}
+
 /// Evaluates a `RouterSnapshot` and generates plain-English tunnel verdicts, route explanations,
 /// and automated drift/risk findings.
-pub fn explain_snapshot(snapshot: RouterSnapshot) -> AnalysisReport {
+pub fn explain_snapshot(mut snapshot: RouterSnapshot) -> AnalysisReport {
+    if let Some(filter) = snapshot.peer_filter.clone() {
+        let target_sys = snapshot
+            .tunnels
+            .iter()
+            .find(|t| t.remote_system_ip == filter || t.remote_ip == filter)
+            .and_then(|t| {
+                if t.remote_system_ip.is_empty() {
+                    None
+                } else {
+                    Some(t.remote_system_ip.clone())
+                }
+            })
+            .or_else(|| {
+                snapshot
+                    .remote_tlocs
+                    .iter()
+                    .find(|rt| {
+                        rt.system_ip == filter || rt.public_ip == filter || rt.private_ip == filter
+                    })
+                    .map(|rt| rt.system_ip.clone())
+            })
+            .unwrap_or_else(|| filter.clone());
+
+        snapshot
+            .tunnels
+            .retain(|t| t.remote_system_ip == target_sys || t.remote_ip == filter);
+        snapshot.remote_tlocs.retain(|rt| {
+            rt.system_ip == target_sys || rt.public_ip == filter || rt.private_ip == filter
+        });
+        snapshot.omp_routes.retain(|r| {
+            r.originator == target_sys
+                || r.next_hop_tloc_ip == target_sys
+                || r.from_peer == target_sys
+        });
+    }
+
+    let peer_summaries = build_peer_summaries(&snapshot);
     let up_local_colors: BTreeSet<String> = snapshot
         .tunnels
         .iter()
@@ -264,11 +419,25 @@ pub fn explain_snapshot(snapshot: RouterSnapshot) -> AnalysisReport {
         });
     }
 
+    tunnel_verdicts.sort_by(|a, b| {
+        verdict_rank(&a.verdict)
+            .cmp(&verdict_rank(&b.verdict))
+            .then_with(|| {
+                Reverse(a.recent_tx_data_pkts + a.recent_rx_data_pkts)
+                    .cmp(&Reverse(b.recent_tx_data_pkts + b.recent_rx_data_pkts))
+            })
+            .then_with(|| Reverse(a.est_cum_data_pkts).cmp(&Reverse(b.est_cum_data_pkts)))
+            .then_with(|| a.remote_system_ip.cmp(&b.remote_system_ip))
+            .then_with(|| a.local_color.cmp(&b.local_color))
+            .then_with(|| a.remote_color.cmp(&b.remote_color))
+    });
+
     let findings = collect_drift_findings(&snapshot, &tunnel_verdicts);
 
     AnalysisReport {
         snapshot,
         active_primary_tunnels,
+        peer_summaries,
         tunnel_verdicts,
         route_explanations,
         findings,
@@ -863,5 +1032,92 @@ app-route statistics 10.10.2.21 172.16.2.21 ipsec 12346 12346
         assert_eq!(primary.bfd_state, "up");
         assert_eq!(primary.detect_multiplier, 3);
         assert_eq!(primary.verdict, VerdictKind::ActivePrimary);
+    }
+
+    #[test]
+    fn discovers_service_vrfs_and_filters_by_peer_cleanly() {
+        let multi_peer_capture = r#"
+hub1#show vrf
+  Name                             Default RD            Protocols   Interfaces
+  10                               <not set>             ipv4,ipv6   Gi3.10
+  100                              <not set>             ipv4        Gi3.100
+  65528                            <not set>             ipv4        Lo65528
+  65529                            <not set>             ipv4        Lo65529
+  Mgmt-intf                        <not set>             ipv4        Gi0
+hub1#show sdwan running-config sdwan
+sdwan
+ interface GigabitEthernet1
+  tunnel-interface
+   encapsulation ipsec preference 200 weight 1
+   color biz-internet
+  exit
+ exit
+!
+hub1#show sdwan bfd sessions
+SYSTEM IP        SITE ID     STATE       SOURCE TLOC      REMOTE TLOC                                      DST PUBLIC                      DST PUBLIC         DETECT      TX
+10.255.2.10      200         up          biz-internet     biz-internet     10.10.1.1                                       172.16.20.2                                     12346       ipsec  3           1000           0:01:00:00      0
+10.255.3.10      300         up          biz-internet     public-internet  10.10.1.1                                       172.16.30.2                                     12346       ipsec  3           1000           0:01:00:00      0
+hub1#show sdwan omp tlocs
+---------------------------------------------------
+tloc entries for 10.255.2.10
+                 biz-internet
+                 ipsec
+---------------------------------------------------
+            RECEIVED FROM:
+peer            10.255.0.3
+status          C,I,R
+    Attributes:
+     public-ip         172.16.20.2
+     private-ip        172.16.20.2
+     site-id           200
+     preference        200
+---------------------------------------------------
+tloc entries for 10.255.3.10
+                 public-internet
+                 ipsec
+---------------------------------------------------
+            RECEIVED FROM:
+peer            10.255.0.3
+status          C,I,R
+    Attributes:
+     public-ip         172.16.30.2
+     private-ip        172.16.30.2
+     site-id           300
+     preference        100
+hub1#show sdwan omp routes
+TENANT    VPN    PREFIX              FROM PEER        ID     LABEL    STATUS    TYPE       TLOC IP          COLOR            ENCAP  PREFERENCE  NUMBER      REGION ID   REGION PATH
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+0         10     10.20.0.0/16        10.255.0.3       1      1001     C,I,R     installed  10.255.2.10      biz-internet     ipsec  -           None        None        -
+0         200    10.30.0.0/16        10.255.0.3       1      1002     C,I,R     installed  10.255.3.10      public-internet  ipsec  -           None        None        -
+hub1#show sdwan app-route stats
+app-route statistics 10.10.1.1 172.16.20.2 ipsec 12346 12346
+ remote-system-ip 10.255.2.10
+ local-color biz-internet
+ remote-color biz-internet
+ sla-class-index 0
+ interval 0
+  tx-data-pkts 40
+  rx-data-pkts 30
+app-route statistics 10.10.1.1 172.16.30.2 ipsec 12346 12346
+ remote-system-ip 10.255.3.10
+ local-color biz-internet
+ remote-color public-internet
+ sla-class-index 0
+ interval 0
+  tx-data-pkts 0
+  rx-data-pkts 0
+"#;
+        let mut snap = build_snapshot_from_text("hub1", "10.255.1.1", "10", "ssh", multi_peer_capture);
+        assert_eq!(snap.discovered_vpns, vec!["10", "100", "200"]);
+
+        // Test peer filter by remote WAN IP resolves to System IP 10.255.3.10
+        snap.peer_filter = Some("172.16.30.2".to_string());
+        let filtered = explain_snapshot(snap);
+        assert_eq!(filtered.tunnel_verdicts.len(), 1);
+        assert_eq!(filtered.tunnel_verdicts[0].remote_system_ip, "10.255.3.10");
+        assert_eq!(filtered.peer_summaries.len(), 1);
+        assert_eq!(filtered.peer_summaries[0].site_id, "300");
+        assert_eq!(filtered.route_explanations.len(), 1);
+        assert_eq!(filtered.route_explanations[0].vpn_id, "200");
     }
 }

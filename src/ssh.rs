@@ -10,7 +10,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use regex::Regex;
 
 use crate::models::{runtime_scratch_dir, utc_now_rfc3339, RouterSnapshot};
-use crate::parsers::{build_snapshot_from_text, parse_omp_routes, parse_omp_tlocs};
+use crate::parsers::{
+    build_snapshot_from_text, parse_bfd_sessions, parse_omp_routes, parse_omp_tlocs,
+    sort_unique_vpns,
+};
 
 /// Validates that every CLI command sent over SSH is strictly read-only.
 pub fn validate_readonly_cli_command(cmd: &str) -> Result<&str, String> {
@@ -182,9 +185,35 @@ pub struct SshTarget<'a> {
     pub password: Option<&'a str>,
     pub is_vsmart: bool,
     pub vpn_id: &'a str,
+    pub peer: Option<&'a str>,
+    pub discover: bool,
     pub flow_spec: Option<&'a str>,
     pub timeout_secs: u64,
     pub debug: bool,
+}
+
+fn resolve_peer_system_ip_in_session(raw_so_far: &str, peer_arg: &str) -> Option<String> {
+    let trimmed = peer_arg.trim();
+    if trimmed.parse::<std::net::Ipv4Addr>().is_err() {
+        return None;
+    }
+    for b in parse_bfd_sessions(raw_so_far) {
+        if b.remote_system_ip == trimmed {
+            return Some(trimmed.to_string());
+        }
+        if b.remote_ip == trimmed && !b.remote_system_ip.is_empty() {
+            return Some(b.remote_system_ip);
+        }
+    }
+    for t in parse_omp_tlocs(raw_so_far) {
+        if t.system_ip == trimmed {
+            return Some(trimmed.to_string());
+        }
+        if (t.public_ip == trimmed || t.private_ip == trimmed) && !t.system_ip.is_empty() {
+            return Some(t.system_ip);
+        }
+    }
+    Some(trimmed.to_string())
 }
 
 /// Runs a batch of read-only CLI commands over native OpenSSH with continuous pipe draining,
@@ -368,23 +397,40 @@ pub fn run_ssh_commands(target: &SshTarget<'_>, commands: &[String]) -> Result<S
                 break;
             }
 
-            eprintln!("[{}/{}] {} ...", idx + 1, commands.len(), cmd_str);
+            let actual_cmd = if cmd_str == "show sdwan app-route stats" {
+                if let Some(peer_arg) = target.peer {
+                    let snapshot_so_far = stdout_buf.lock().map(|g| g.clone()).unwrap_or_default();
+                    if let Some(sys_ip) = resolve_peer_system_ip_in_session(&snapshot_so_far, peer_arg) {
+                        let narrowed = format!("show sdwan app-route stats remote-system-ip {sys_ip}");
+                        validate_readonly_cli_command(&narrowed)?;
+                        narrowed
+                    } else {
+                        cmd_str.clone()
+                    }
+                } else {
+                    cmd_str.clone()
+                }
+            } else {
+                cmd_str.clone()
+            };
+
+            eprintln!("[{}/{}] {} ...", idx + 1, commands.len(), actual_cmd);
             let cmd_t0 = Instant::now();
             let start_len = stdout_buf.lock().map(|g| g.len()).unwrap_or(0);
             last_more_len = start_len;
 
             if let Err(e) = child_stdin
-                .write_all(format!("{cmd_str}\n").as_bytes())
+                .write_all(format!("{actual_cmd}\n").as_bytes())
                 .and_then(|_| child_stdin.flush())
             {
-                log_lines.push(format!("[+{:.2}s] stdin write failed on '{}': {e}", session_start.elapsed().as_secs_f64(), cmd_str));
+                log_lines.push(format!("[+{:.2}s] stdin write failed on '{}': {e}", session_start.elapsed().as_secs_f64(), actual_cmd));
                 break;
             }
 
             loop {
                 if Instant::now() >= total_deadline {
                     timed_out = true;
-                    timed_out_cmd = cmd_str.clone();
+                    timed_out_cmd = actual_cmd.clone();
                     break;
                 }
 
@@ -422,7 +468,7 @@ pub fn run_ssh_commands(target: &SshTarget<'_>, commands: &[String]) -> Result<S
                         session_start.elapsed().as_secs_f64(),
                         idx + 1,
                         commands.len(),
-                        cmd_str
+                        actual_cmd
                     );
                     log_lines.push(msg.clone());
                     if target.debug {
@@ -569,22 +615,45 @@ pub fn run_ssh_commands(target: &SshTarget<'_>, commands: &[String]) -> Result<S
 
 /// Collects a full `RouterSnapshot` from either an IOS-XE `cEdge` router or a `vSmart` controller over SSH.
 pub fn collect_via_ssh(target: &SshTarget<'_>) -> Result<RouterSnapshot, String> {
-    let vpn_id = target.vpn_id;
+    let all_vpns = target.vpn_id.is_empty() || target.vpn_id.eq_ignore_ascii_case("all");
     let mut cmds: Vec<String> = if target.is_vsmart {
-        vec![
-            "paginate false".to_string(),
-            "show omp tlocs".to_string(),
-            format!("show omp routes vpn {vpn_id}"),
-            "show running-config apply-policy".to_string(),
-        ]
-    } else {
+        if target.discover {
+            vec!["paginate false".to_string(), "show omp tlocs".to_string()]
+        } else {
+            let routes_cmd = if all_vpns {
+                "show omp routes".to_string()
+            } else {
+                format!("show omp routes vpn {}", target.vpn_id)
+            };
+            vec![
+                "paginate false".to_string(),
+                "show omp tlocs".to_string(),
+                routes_cmd,
+                "show running-config apply-policy".to_string(),
+            ]
+        }
+    } else if target.discover {
         vec![
             "terminal length 0".to_string(),
+            "show vrf".to_string(),
             "show sdwan control local-properties".to_string(),
             "show sdwan running-config sdwan".to_string(),
-            "show sdwan omp tlocs".to_string(),
-            format!("show sdwan omp routes vpn {vpn_id}"),
             "show sdwan bfd sessions".to_string(),
+        ]
+    } else {
+        let routes_cmd = if all_vpns {
+            "show sdwan omp routes".to_string()
+        } else {
+            format!("show sdwan omp routes vpn {}", target.vpn_id)
+        };
+        vec![
+            "terminal length 0".to_string(),
+            "show vrf".to_string(),
+            "show sdwan control local-properties".to_string(),
+            "show sdwan running-config sdwan".to_string(),
+            "show sdwan bfd sessions".to_string(),
+            "show sdwan omp tlocs".to_string(),
+            routes_cmd,
             "show sdwan tunnel statistics".to_string(),
             "show sdwan app-route stats".to_string(),
         ]
@@ -600,6 +669,8 @@ pub fn collect_via_ssh(target: &SshTarget<'_>) -> Result<RouterSnapshot, String>
         let tlocs = parse_omp_tlocs(&raw);
         let routes = parse_omp_routes(&raw);
         let mut snap = build_snapshot_from_text("vsmart", target.host, "100", "ssh-vsmart", &raw);
+        snap.discovered_vpns = sort_unique_vpns(routes.iter().map(|r| r.vpn_id.as_str()));
+        snap.peer_filter = target.peer.map(String::from);
         snap.remote_tlocs = tlocs;
         snap.omp_routes = routes;
         if let Some(idx) = raw.find("apply-policy") {
@@ -609,7 +680,10 @@ pub fn collect_via_ssh(target: &SshTarget<'_>) -> Result<RouterSnapshot, String>
     }
 
     let (sys_ip, site_id, host_name) = extract_system_identity(&raw, target.host);
-    Ok(build_snapshot_from_text(&host_name, &sys_ip, &site_id, "ssh", &raw))
+    let mode_label = if target.discover { "ssh-discover" } else { "ssh" };
+    let mut snap = build_snapshot_from_text(&host_name, &sys_ip, &site_id, mode_label, &raw);
+    snap.peer_filter = target.peer.map(String::from);
+    Ok(snap)
 }
 
 pub(crate) fn extract_system_identity(raw: &str, fallback_host: &str) -> (String, String, String) {
@@ -624,6 +698,7 @@ pub(crate) fn extract_system_identity(raw: &str, fallback_host: &str) -> (String
         if t.starts_with("tloc entries for ")
             || t.starts_with("tunnel stats ")
             || t.starts_with("app-route statistics ")
+            || t.starts_with("SYSTEM IP")
         {
             break;
         }

@@ -29,6 +29,7 @@ enum CommandMode {
         password_env: Option<String>,
         vsmart: bool,
         vpn: String,
+        discover: bool,
         flow: Option<String>,
         timeout_secs: u64,
         debug: bool,
@@ -51,9 +52,58 @@ enum CommandMode {
 #[derive(Debug)]
 struct CliArgs {
     mode: CommandMode,
+    peer: Option<String>,
+    all_tunnels: bool,
     json: bool,
     markdown_out: Option<String>,
     no_color: bool,
+}
+
+#[derive(Debug)]
+struct CommonOpts {
+    peer: Option<String>,
+    all_tunnels: bool,
+    json: bool,
+    markdown_out: Option<String>,
+    no_color: bool,
+}
+
+impl CommonOpts {
+    fn new() -> Self {
+        Self {
+            peer: None,
+            all_tunnels: false,
+            json: false,
+            markdown_out: None,
+            no_color: !io::stdout().is_terminal(),
+        }
+    }
+
+    fn try_consume(&mut self, args: &[String], idx: &mut usize) -> Result<bool, String> {
+        match args[*idx].as_str() {
+            "--peer" => {
+                self.peer = Some(take_val(args, idx, "--peer")?);
+                Ok(true)
+            }
+            "--all-tunnels" => {
+                self.all_tunnels = true;
+                Ok(true)
+            }
+            "--json" => {
+                self.json = true;
+                Ok(true)
+            }
+            "--markdown" => {
+                self.markdown_out = Some(take_val(args, idx, "--markdown")?);
+                Ok(true)
+            }
+            "--no-color" => {
+                self.no_color = true;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
 }
 
 fn print_help() {
@@ -61,18 +111,22 @@ fn print_help() {
         r#"tloc-explain — Cisco Catalyst SD-WAN TLOC, OMP Route & Transport Preferencing Explainer
 
 USAGE:
-  tloc-explain [ssh] <host> [-u <user>] [-p <port>] [-i <keyfile>] [-P|--ask-pass] [--password-env <VAR>] [--timeout <secs>] [-v|--debug] [--vsmart] [--vpn <id>] [--flow <spec>] [--json] [--markdown <file>] [--no-color]
-  tloc-explain vmanage [--host <host:port>] [--user <user>] [--device <name|sysip|all>] [--vpn <id>] [--insecure] [--json] [--markdown <file>] [--no-color]
-  tloc-explain file <capture.txt> [--hostname <name>] [--system-ip <ip>] [--site-id <id>] [--json] [--markdown <file>] [--no-color]
+  tloc-explain [ssh] <host> [-u <user>] [-p <port>] [-i <keyfile>] [-P|--ask-pass] [--password-env <VAR>] [--peer <sys-ip|wan-ip>] [--vpn <id|all>] [--discover] [--all-tunnels] [--timeout <secs>] [-v|--debug] [--vsmart] [--flow <spec>] [--json] [--markdown <file>] [--no-color]
+  tloc-explain vmanage [--host <host:port>] [--user <user>] [--device <name|sysip|all>] [--peer <ip>] [--vpn <id|all>] [--all-tunnels] [--insecure] [--json] [--markdown <file>] [--no-color]
+  tloc-explain file <capture.txt> [--hostname <name>] [--system-ip <ip>] [--site-id <id>] [--peer <ip>] [--all-tunnels] [--json] [--markdown <file>] [--no-color]
 
 EXAMPLES:
-  tloc-explain 10.10.1.21 -u admin
-  tloc-explain 10.10.1.21 -u admin -P --timeout 180 -v
-  tloc-explain 10.10.1.21 -u admin -i ~/.ssh/id_ed25519
-  tloc-explain 172.16.1.21 --markdown /tmp/border1-report.md
+  # Fast ~3s discovery of active Service VPNs and remote peers on a hub/branch:
+  tloc-explain 10.10.1.21 -u admin --discover
+
+  # Focus full analysis (and router-side app-route stats) on one peer & Service VPN:
+  tloc-explain 10.10.1.21 -u admin --peer 10.255.1.1
+  tloc-explain 10.10.1.21 -u admin --peer 10.255.1.1 --vpn 10
+
+  # Default auto-discovers all Service VPNs and summarizes large standby tunnel sets:
+  tloc-explain 10.10.1.21 -u admin --timeout 180 -v
+  tloc-explain 10.10.1.21 -u admin -i ~/.ssh/id_ed25519 --all-tunnels
   tloc-explain ssh 172.16.1.12 -u admin --vsmart
-  tloc-explain file router_capture.txt --hostname site101-kit1 --system-ip 10.255.1.11 --site-id 1011
-  tloc-explain vmanage --device all
 
 AUTHENTICATION & DIAGNOSTICS:
   Direct SSH uses `-i <keyfile>` if given, or checks TLOC_SSH_PASS / ROUTER_SSH_PASS
@@ -92,9 +146,7 @@ fn take_val(args: &[String], idx: &mut usize, flag: &str) -> Result<String, Stri
 }
 
 fn parse_ssh_args(args: &[String]) -> Result<CliArgs, String> {
-    let mut json = false;
-    let mut markdown_out = None;
-    let mut no_color = !io::stdout().is_terminal();
+    let mut common = CommonOpts::new();
 
     let mut host = String::new();
     let mut user = "admin".to_string();
@@ -104,13 +156,18 @@ fn parse_ssh_args(args: &[String]) -> Result<CliArgs, String> {
     let mut password = None;
     let mut password_env = None;
     let mut vsmart = false;
-    let mut vpn = "1000".to_string();
+    let mut vpn = "all".to_string();
+    let mut discover = false;
     let mut flow = None;
     let mut timeout_secs = 120u64;
     let mut debug = false;
 
     let mut i = 0usize;
     while i < args.len() {
+        if common.try_consume(args, &mut i)? {
+            i += 1;
+            continue;
+        }
         match args[i].as_str() {
             "-h" | "--help" => {
                 print_help();
@@ -135,10 +192,8 @@ fn parse_ssh_args(args: &[String]) -> Result<CliArgs, String> {
             "-v" | "--debug" => debug = true,
             "--vsmart" => vsmart = true,
             "--vpn" => vpn = take_val(args, &mut i, "--vpn")?,
+            "--discover" => discover = true,
             "--flow" => flow = Some(take_val(args, &mut i, "--flow")?),
-            "--json" => json = true,
-            "--markdown" => markdown_out = Some(take_val(args, &mut i, "--markdown")?),
-            "--no-color" => no_color = true,
             arg if !arg.starts_with('-') && host.is_empty() => host = arg.to_string(),
             other => return Err(format!("Unknown argument: {other}")),
         }
@@ -160,13 +215,16 @@ fn parse_ssh_args(args: &[String]) -> Result<CliArgs, String> {
             password_env,
             vsmart,
             vpn,
+            discover,
             flow,
             timeout_secs,
             debug,
         },
-        json,
-        markdown_out,
-        no_color,
+        peer: common.peer,
+        all_tunnels: common.all_tunnels,
+        json: common.json,
+        markdown_out: common.markdown_out,
+        no_color: common.no_color,
     })
 }
 
@@ -178,10 +236,7 @@ fn parse_args() -> Result<CliArgs, String> {
     }
 
     let sub = args[0].as_str();
-    let mut json = false;
-    let mut markdown_out = None;
-    let mut no_color = !io::stdout().is_terminal();
-
+    let mut common = CommonOpts::new();
     let mut i = 1usize;
 
     match sub {
@@ -190,10 +245,14 @@ fn parse_args() -> Result<CliArgs, String> {
             let mut host = None;
             let mut user = None;
             let mut device = "all".to_string();
-            let mut vpn = "1000".to_string();
+            let mut vpn = "all".to_string();
             let mut insecure = true;
 
             while i < args.len() {
+                if common.try_consume(&args, &mut i)? {
+                    i += 1;
+                    continue;
+                }
                 match args[i].as_str() {
                     "-h" | "--help" => {
                         print_help();
@@ -205,9 +264,6 @@ fn parse_args() -> Result<CliArgs, String> {
                     "--vpn" => vpn = take_val(&args, &mut i, "--vpn")?,
                     "--insecure" => insecure = true,
                     "--verify-tls" => insecure = false,
-                    "--json" => json = true,
-                    "--markdown" => markdown_out = Some(take_val(&args, &mut i, "--markdown")?),
-                    "--no-color" => no_color = true,
                     other => return Err(format!("Unknown argument for 'vmanage': {other}")),
                 }
                 i += 1;
@@ -220,9 +276,11 @@ fn parse_args() -> Result<CliArgs, String> {
                     vpn,
                     insecure,
                 },
-                json,
-                markdown_out,
-                no_color,
+                peer: common.peer,
+                all_tunnels: common.all_tunnels,
+                json: common.json,
+                markdown_out: common.markdown_out,
+                no_color: common.no_color,
             })
         }
         "file" => {
@@ -232,6 +290,10 @@ fn parse_args() -> Result<CliArgs, String> {
             let mut site_id = String::new();
 
             while i < args.len() {
+                if common.try_consume(&args, &mut i)? {
+                    i += 1;
+                    continue;
+                }
                 match args[i].as_str() {
                     "-h" | "--help" => {
                         print_help();
@@ -240,9 +302,6 @@ fn parse_args() -> Result<CliArgs, String> {
                     "--hostname" => hostname = take_val(&args, &mut i, "--hostname")?,
                     "--system-ip" => system_ip = take_val(&args, &mut i, "--system-ip")?,
                     "--site-id" => site_id = take_val(&args, &mut i, "--site-id")?,
-                    "--json" => json = true,
-                    "--markdown" => markdown_out = Some(take_val(&args, &mut i, "--markdown")?),
-                    "--no-color" => no_color = true,
                     arg if !arg.starts_with('-') && path.is_empty() => path = arg.to_string(),
                     other => return Err(format!("Unknown argument for 'file': {other}")),
                 }
@@ -258,9 +317,11 @@ fn parse_args() -> Result<CliArgs, String> {
                     system_ip,
                     site_id,
                 },
-                json,
-                markdown_out,
-                no_color,
+                peer: common.peer,
+                all_tunnels: common.all_tunnels,
+                json: common.json,
+                markdown_out: common.markdown_out,
+                no_color: common.no_color,
             })
         }
         _ => parse_ssh_args(&args),
@@ -351,7 +412,8 @@ fn main() {
                     process::exit(1);
                 }
             };
-            let snap = build_snapshot_from_text(hostname, system_ip, site_id, "file", &content);
+            let mut snap = build_snapshot_from_text(hostname, system_ip, site_id, "file", &content);
+            snap.peer_filter = cli.peer.clone();
             vec![explain_snapshot(snap)]
         }
         CommandMode::Ssh {
@@ -364,6 +426,7 @@ fn main() {
             password_env,
             vsmart,
             vpn,
+            discover,
             flow,
             timeout_secs,
             debug,
@@ -400,6 +463,8 @@ fn main() {
                 password: resolved_pw.as_deref(),
                 is_vsmart: *vsmart,
                 vpn_id: vpn,
+                peer: cli.peer.as_deref(),
+                discover: *discover,
                 flow_spec: flow.as_deref(),
                 timeout_secs: *timeout_secs,
                 debug: *debug,
@@ -462,7 +527,10 @@ fn main() {
             let mut out = Vec::new();
             for dev in targets {
                 match client.collect_device_snapshot(&dev, vpn) {
-                    Ok(snap) => out.push(explain_snapshot(snap)),
+                    Ok(mut snap) => {
+                        snap.peer_filter = cli.peer.clone();
+                        out.push(explain_snapshot(snap));
+                    }
                     Err(e) => eprintln!("Warning: failed collecting {}: {e}", dev.host_name),
                 }
             }
@@ -475,14 +543,14 @@ fn main() {
         println!("{json_out}");
     } else {
         for r in &reports {
-            print!("{}", render_terminal(r, !cli.no_color));
+            print!("{}", render_terminal(r, !cli.no_color, cli.all_tunnels));
         }
     }
 
     if let Some(md_path) = &cli.markdown_out {
         let mut combined = String::new();
         for r in &reports {
-            combined.push_str(&render_markdown(r));
+            combined.push_str(&render_markdown(r, cli.all_tunnels));
             combined.push_str("\n---\n\n");
         }
         if let Err(e) = fs::write(md_path, combined) {
@@ -506,17 +574,23 @@ mod tests {
             "-i",
             "/home/russb/.ssh/id_ed25519",
             "-P",
+            "--peer",
+            "10.255.1.1",
+            "--discover",
+            "--all-tunnels",
             "--timeout",
             "180",
             "-v",
             "--vpn",
-            "1000",
+            "10",
         ]
         .into_iter()
         .map(String::from)
         .collect();
 
         let cli = parse_ssh_args(&args).expect("valid ssh args");
+        assert_eq!(cli.peer.as_deref(), Some("10.255.1.1"));
+        assert!(cli.all_tunnels);
         match cli.mode {
             CommandMode::Ssh {
                 host,
@@ -524,6 +598,7 @@ mod tests {
                 identity_file,
                 ask_pass,
                 vpn,
+                discover,
                 timeout_secs,
                 debug,
                 ..
@@ -532,7 +607,8 @@ mod tests {
                 assert_eq!(user, "netops");
                 assert_eq!(identity_file.as_deref(), Some("/home/russb/.ssh/id_ed25519"));
                 assert!(ask_pass);
-                assert_eq!(vpn, "1000");
+                assert_eq!(vpn, "10");
+                assert!(discover);
                 assert_eq!(timeout_secs, 180);
                 assert!(debug);
             }

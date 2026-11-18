@@ -1,8 +1,70 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use regex::Regex;
 
 use crate::models::{utc_now_rfc3339, OmpRouteEntry, RouterSnapshot, TlocEntry, TunnelDiag};
+
+/// Parses `show vrf` output into sorted Service VPN / VRF identifiers, excluding IOS-XE internal
+/// management/loopback VRFs (`65528`, `65529`, `Mgmt-intf`, `Mgmt-vrf`).
+pub fn parse_vrfs(text: &str) -> Vec<String> {
+    let mut vpns = Vec::new();
+    let mut in_vrf_table = false;
+
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.contains('#') {
+            in_vrf_table = false;
+            continue;
+        }
+        if trimmed.contains("Name") && trimmed.contains("Default RD") {
+            in_vrf_table = true;
+            continue;
+        }
+        if !in_vrf_table {
+            continue;
+        }
+        if trimmed.starts_with('-') {
+            continue;
+        }
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        if tokens.is_empty() {
+            continue;
+        }
+        let name = tokens[0];
+        if matches!(name, "65528" | "65529")
+            || name.eq_ignore_ascii_case("mgmt-intf")
+            || name.eq_ignore_ascii_case("mgmt-vrf")
+        {
+            continue;
+        }
+        // Only treat VRF table rows (second column is `<not set>` or RD like `100:1`) as VRFs
+        if tokens.len() >= 2 && (trimmed.contains("<not set>") || tokens[1].contains(':')) {
+            vpns.push(name.to_string());
+        } else {
+            in_vrf_table = false;
+        }
+    }
+
+    sort_unique_vpns(vpns.iter().map(String::as_str))
+}
+
+/// Deduplicates and sorts Service VPN IDs numerically first, then lexicographically.
+pub fn sort_unique_vpns<'a, I: IntoIterator<Item = &'a str>>(items: I) -> Vec<String> {
+    let set: BTreeSet<String> = items
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "0" && *s != "65528" && *s != "65529")
+        .map(String::from)
+        .collect();
+    let mut out: Vec<String> = set.into_iter().collect();
+    out.sort_by(|a, b| match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(na), Ok(nb)) => na.cmp(&nb),
+        (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Err(_)) => a.cmp(b),
+    });
+    out
+}
 
 /// Parsed local SD-WAN interface attributes extracted from `show sdwan running-config sdwan`.
 #[derive(Debug, Clone, Default)]
@@ -571,6 +633,7 @@ pub fn parse_bfd_sessions(text: &str) -> Vec<TunnelDiag> {
             src_ip,
             dst_ip,
             sys_ip,
+            site_id,
             state,
             mult,
             tx_int,
@@ -586,6 +649,7 @@ pub fn parse_bfd_sessions(text: &str) -> Vec<TunnelDiag> {
                 tokens[5].to_string(),
                 tokens[6].to_string(),
                 tokens[0].to_string(),
+                tokens[1].to_string(),
                 tokens[2].to_lowercase(),
                 tokens[9].parse::<u32>().unwrap_or(0),
                 tokens[10].parse::<u32>().unwrap_or(1000),
@@ -601,6 +665,7 @@ pub fn parse_bfd_sessions(text: &str) -> Vec<TunnelDiag> {
                 tokens[0].to_string(),
                 tokens[1].to_string(),
                 tokens.get(5).copied().unwrap_or("").to_string(),
+                tokens.get(6).copied().unwrap_or("").to_string(),
                 tokens.get(7).copied().unwrap_or("").to_lowercase(),
                 tokens.get(8).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0),
                 tokens.get(9).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1000),
@@ -617,6 +682,7 @@ pub fn parse_bfd_sessions(text: &str) -> Vec<TunnelDiag> {
             local_ip: src_ip,
             remote_ip: dst_ip,
             remote_system_ip: sys_ip,
+            remote_site_id: site_id,
             local_color,
             remote_color,
             bfd_state: state,
@@ -721,12 +787,20 @@ pub fn build_snapshot_from_text(
         local_tlocs.extend(seen.into_values());
     }
 
+    let mut vpn_refs: Vec<String> = parse_vrfs(text);
+    for r in &omp_routes {
+        vpn_refs.push(r.vpn_id.clone());
+    }
+    let discovered_vpns = sort_unique_vpns(vpn_refs.iter().map(String::as_str));
+
     RouterSnapshot {
         host_name: inferred_host,
         system_ip: system_ip.to_string(),
         site_id: site_id.to_string(),
         source_mode: source_mode.to_string(),
         captured_at_utc: utc_now_rfc3339(),
+        discovered_vpns,
+        peer_filter: None,
         local_tlocs,
         remote_tlocs,
         omp_routes,

@@ -11,7 +11,10 @@ use serde_json::Value;
 use crate::models::{
     runtime_scratch_dir, utc_now_rfc3339, OmpRouteEntry, RouterSnapshot, TlocEntry, TunnelDiag,
 };
-use crate::parsers::{compute_tunnel_averages, is_route_chosen_installed, merge_tunnel_diags, parse_running_config_sdwan};
+use crate::parsers::{
+    compute_tunnel_averages, is_route_chosen_installed, merge_tunnel_diags,
+    parse_running_config_sdwan, sort_unique_vpns,
+};
 
 struct CookieJarGuard {
     path: PathBuf,
@@ -259,7 +262,11 @@ impl VManageClient {
         let p_cfg = format!("/dataservice/template/config/running/{uuid}");
         let p_tloc_adv = format!("/dataservice/device/omp/tlocs/advertised?deviceId={sys_ip}");
         let p_tloc_recv = format!("/dataservice/device/omp/tlocs/received?deviceId={sys_ip}");
-        let p_routes = format!("/dataservice/device/omp/routes/received?deviceId={sys_ip}&vpn-id={vpn_id}");
+        let p_routes = if vpn_id.eq_ignore_ascii_case("all") || vpn_id.is_empty() {
+            format!("/dataservice/device/omp/routes/received?deviceId={sys_ip}")
+        } else {
+            format!("/dataservice/device/omp/routes/received?deviceId={sys_ip}&vpn-id={vpn_id}")
+        };
         let p_bfd = format!("/dataservice/device/bfd/sessions?deviceId={sys_ip}");
         let p_tun = format!("/dataservice/device/tunnel/statistics?deviceId={sys_ip}");
         let p_app = format!("/dataservice/device/app-route/statistics?deviceId={sys_ip}");
@@ -317,12 +324,16 @@ impl VManageClient {
             compute_tunnel_averages(td);
         }
 
+        let discovered_vpns = sort_unique_vpns(omp_routes.iter().map(|r| r.vpn_id.as_str()));
+
         Ok(RouterSnapshot {
             host_name: dev.host_name.clone(),
             system_ip: dev.system_ip.clone(),
             site_id: dev.site_id.clone(),
             source_mode: "vmanage".to_string(),
             captured_at_utc: utc_now_rfc3339(),
+            discovered_vpns,
+            peer_filter: None,
             local_tlocs,
             remote_tlocs,
             omp_routes,
@@ -446,6 +457,7 @@ fn parse_vmanage_bfd(val: &Value) -> Vec<TunnelDiag> {
             local_ip: json_str(&r, "src-ip"),
             remote_ip: json_str(&r, "dst-ip"),
             remote_system_ip: json_str(&r, "system-ip"),
+            remote_site_id: json_str(&r, "site-id"),
             local_color: json_str(&r, "local-color"),
             remote_color: json_str(&r, "color"),
             bfd_state: json_str(&r, "state").to_lowercase(),

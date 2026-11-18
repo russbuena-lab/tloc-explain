@@ -55,6 +55,8 @@ pub struct RouterSnapshot {
     pub site_id: String,
     pub source_mode: String,
     pub captured_at_utc: String,
+    pub discovered_vpns: Vec<String>,
+    pub peer_filter: Option<String>,
     pub local_tlocs: Vec<TlocEntry>,
     pub remote_tlocs: Vec<TlocEntry>,
     pub omp_routes: Vec<OmpRouteEntry>,
@@ -103,6 +105,7 @@ pub struct TunnelDiag {
     pub local_ip: String,
     pub remote_ip: String,
     pub remote_system_ip: String,
+    pub remote_site_id: String,
     pub local_color: String,
     pub remote_color: String,
     pub bfd_state: String,
@@ -211,10 +214,23 @@ pub struct DriftFinding {
     pub remediation: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PeerSummary {
+    pub system_ip: String,
+    pub site_id: String,
+    pub tunnels_up: usize,
+    pub tunnels_total: usize,
+    pub recent_tx_pkts: u64,
+    pub recent_rx_pkts: u64,
+    pub colors: Vec<String>,
+    pub remote_ips: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisReport {
     pub snapshot: RouterSnapshot,
     pub active_primary_tunnels: Vec<String>,
+    pub peer_summaries: Vec<PeerSummary>,
     pub tunnel_verdicts: Vec<TunnelVerdict>,
     pub route_explanations: Vec<RouteExplanation>,
     pub findings: Vec<DriftFinding>,

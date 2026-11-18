@@ -1,7 +1,7 @@
 use crate::models::{AnalysisReport, Severity, VerdictKind};
 
 /// Renders an `AnalysisReport` as human-readable terminal text (ANSI color optional).
-pub fn render_terminal(report: &AnalysisReport, use_color: bool) -> String {
+pub fn render_terminal(report: &AnalysisReport, use_color: bool, show_all_tunnels: bool) -> String {
     let c_bold = if use_color { "\x1b[1m" } else { "" };
     let c_cyan = if use_color { "\x1b[1;36m" } else { "" };
     let c_green = if use_color { "\x1b[1;32m" } else { "" };
@@ -11,6 +11,7 @@ pub fn render_terminal(report: &AnalysisReport, use_color: bool) -> String {
     let c_reset = if use_color { "\x1b[0m" } else { "" };
 
     let snap = &report.snapshot;
+    let is_discover = snap.source_mode == "ssh-discover";
     let mut out = String::new();
 
     out.push_str(&format!(
@@ -27,7 +28,21 @@ pub fn render_terminal(report: &AnalysisReport, use_color: bool) -> String {
         "{c_cyan}=============================================================================={c_reset}\n"
     ));
 
-    if report.active_primary_tunnels.is_empty() {
+    let vpns_display = if snap.discovered_vpns.is_empty() {
+        "none".to_string()
+    } else {
+        snap.discovered_vpns.join(", ")
+    };
+    out.push_str(&format!("{c_bold}Discovered Service VPNs:{c_reset} {vpns_display}\n"));
+    if let Some(peer) = &snap.peer_filter {
+        out.push_str(&format!("{c_bold}Focused Peer:{c_reset} {peer}\n"));
+    }
+
+    if is_discover {
+        out.push_str(&format!(
+            "{c_cyan}Discovery Mode:{c_reset} Pick a peer IP below and re-run with {c_bold}--peer <ip>{c_reset} for full data-plane & OMP route analysis.\n"
+        ));
+    } else if report.active_primary_tunnels.is_empty() {
         out.push_str(&format!(
             "{c_yellow}Summary:{c_reset} No active primary user-data tunnel detected in current telemetry.\n"
         ));
@@ -58,12 +73,51 @@ pub fn render_terminal(report: &AnalysisReport, use_color: bool) -> String {
         }
     }
 
-    // 2. Tunnel Verdicts
+    // 2. Remote Peers Summary
     out.push_str(&format!(
-        "\n{c_bold}2. Tunnel Data-Plane Usage & Plain-English Verdicts ({}){c_reset}\n",
+        "\n{c_bold}2. Remote Peers Summary ({}){c_reset}\n",
+        report.peer_summaries.len()
+    ));
+    if report.peer_summaries.is_empty() {
+        out.push_str(&format!("  {c_dim}(no remote peers found){c_reset}\n"));
+    } else {
+        out.push_str(&format!(
+            "  {c_dim}{:<16} {:<8} {:<12} {:<18} {}{c_reset}\n",
+            "Peer System IP", "Site ID", "BFD Up/Tot", "3m Data (TX/RX)", "Remote Colors & WAN IPs"
+        ));
+        for ps in &report.peer_summaries {
+            let bfd_ratio = format!("{}/{}", ps.tunnels_up, ps.tunnels_total);
+            let data_ratio = format!("{}/{}", ps.recent_tx_pkts, ps.recent_rx_pkts);
+            let detail = format!(
+                "{} ({})",
+                if ps.colors.is_empty() { "-".to_string() } else { ps.colors.join(", ") },
+                if ps.remote_ips.is_empty() { "-".to_string() } else { ps.remote_ips.join(", ") }
+            );
+            out.push_str(&format!(
+                "  {:<16} {:<8} {:<12} {:<18} {}\n",
+                ps.system_ip,
+                non_empty(&ps.site_id, "-"),
+                bfd_ratio,
+                data_ratio,
+                detail
+            ));
+        }
+    }
+
+    // 3. Tunnel Verdicts
+    let collapse_standby =
+        snap.peer_filter.is_none() && !show_all_tunnels && report.tunnel_verdicts.len() > 8;
+    let mut hidden_standby = 0usize;
+
+    out.push_str(&format!(
+        "\n{c_bold}3. Tunnel Data-Plane Usage & Plain-English Verdicts ({}){c_reset}\n",
         report.tunnel_verdicts.len()
     ));
     for tv in &report.tunnel_verdicts {
+        if collapse_standby && tv.verdict == VerdictKind::StandbyBfdOnly {
+            hidden_standby += 1;
+            continue;
+        }
         let badge_color = match tv.verdict {
             VerdictKind::ActivePrimary => c_green,
             VerdictKind::StandbyBfdOnly => c_dim,
@@ -91,12 +145,21 @@ pub fn render_terminal(report: &AnalysisReport, use_color: bool) -> String {
             tv.reason
         ));
     }
+    if hidden_standby > 0 {
+        out.push_str(&format!(
+            "\n  {c_dim}... plus {hidden_standby} idle STANDBY (BFD HEARTBEAT ONLY) tunnels hidden (use --peer <ip> or --all-tunnels to show all).{c_reset}\n"
+        ));
+    }
 
-    // 3. OMP Route Explanations
+    // 4. OMP Route Explanations
     out.push_str(&format!(
-        "\n{c_bold}3. OMP Route Selection (Why Each Prefix Picked Its Path){c_reset}\n"
+        "\n{c_bold}4. OMP Route Selection (Why Each Prefix Picked Its Path){c_reset}\n"
     ));
-    if report.route_explanations.is_empty() {
+    if is_discover {
+        out.push_str(&format!(
+            "  {c_dim}(skipped in --discover mode; re-run with --peer <ip> to inspect OMP routes){c_reset}\n"
+        ));
+    } else if report.route_explanations.is_empty() {
         out.push_str(&format!("  {c_dim}(no received OMP routes in snapshot){c_reset}\n"));
     } else {
         for re in &report.route_explanations {
@@ -115,9 +178,9 @@ pub fn render_terminal(report: &AnalysisReport, use_color: bool) -> String {
         }
     }
 
-    // 4. Automated Drift & Risk Findings
+    // 5. Automated Drift & Risk Findings
     out.push_str(&format!(
-        "\n{c_bold}4. Automated Drift & Risk Findings ({}){c_reset}\n",
+        "\n{c_bold}5. Automated Drift & Risk Findings ({}){c_reset}\n",
         report.findings.len()
     ));
     if report.findings.is_empty() {
@@ -141,7 +204,7 @@ pub fn render_terminal(report: &AnalysisReport, use_color: bool) -> String {
     }
 
     if let Some(pol) = &snap.policy_summary {
-        out.push_str(&format!("\n{c_bold}5. vSmart Apply-Policy Summary{c_reset}\n{}\n", pol));
+        out.push_str(&format!("\n{c_bold}6. vSmart Apply-Policy Summary{c_reset}\n{}\n", pol));
     }
 
     out.push('\n');
@@ -149,22 +212,58 @@ pub fn render_terminal(report: &AnalysisReport, use_color: bool) -> String {
 }
 
 /// Renders an `AnalysisReport` as a clean Markdown report.
-pub fn render_markdown(report: &AnalysisReport) -> String {
+pub fn render_markdown(report: &AnalysisReport, show_all_tunnels: bool) -> String {
     let snap = &report.snapshot;
     let mut md = String::new();
+    let vpns_display = if snap.discovered_vpns.is_empty() {
+        "none".to_string()
+    } else {
+        snap.discovered_vpns.join(", ")
+    };
     md.push_str(&format!(
-        "# TLOC & Route Explanation — `{}`\n\n- **System IP:** `{}`\n- **Site ID:** `{}`\n- **Source:** `{}`\n- **Captured (UTC):** `{}`\n\n",
+        "# TLOC & Route Explanation — `{}`\n\n- **System IP:** `{}`\n- **Site ID:** `{}`\n- **Discovered Service VPNs:** `{}`\n- **Source:** `{}`\n- **Captured (UTC):** `{}`\n",
         snap.host_name,
         non_empty(&snap.system_ip, "-"),
         non_empty(&snap.site_id, "-"),
+        vpns_display,
         snap.source_mode,
         snap.captured_at_utc
     ));
+    if let Some(peer) = &snap.peer_filter {
+        md.push_str(&format!("- **Focused Peer:** `{peer}`\n"));
+    }
+    md.push('\n');
+
+    md.push_str("## Remote Peers Summary\n\n");
+    md.push_str("| Peer System IP | Site ID | BFD (`Up/Total`) | 3m Data (`TX/RX`) | Colors | Remote WAN IPs |\n");
+    md.push_str("| :--- | :---: | :---: | :---: | :--- | :--- |\n");
+    for ps in &report.peer_summaries {
+        md.push_str(&format!(
+            "| `{}` | `{}` | `{}/{}` | `{}/{}` | `{}` | `{}` |\n",
+            ps.system_ip,
+            non_empty(&ps.site_id, "-"),
+            ps.tunnels_up,
+            ps.tunnels_total,
+            ps.recent_tx_pkts,
+            ps.recent_rx_pkts,
+            if ps.colors.is_empty() { "-".to_string() } else { ps.colors.join(", ") },
+            if ps.remote_ips.is_empty() { "-".to_string() } else { ps.remote_ips.join(", ") }
+        ));
+    }
+    md.push('\n');
+
+    let collapse_standby =
+        snap.peer_filter.is_none() && !show_all_tunnels && report.tunnel_verdicts.len() > 8;
+    let mut hidden_standby = 0usize;
 
     md.push_str("## Tunnel Data-Plane Verdicts\n\n");
     md.push_str("| Tunnel (`Local -> Remote`) | Colors | Verdict | Recent Data (`TX / RX`) | Avg Pkt (`TX / RX`) | BFD (`State / Mult`) | Explanation |\n");
     md.push_str("| :--- | :--- | :--- | :---: | :---: | :---: | :--- |\n");
     for tv in &report.tunnel_verdicts {
+        if collapse_standby && tv.verdict == VerdictKind::StandbyBfdOnly {
+            hidden_standby += 1;
+            continue;
+        }
         md.push_str(&format!(
             "| `{} -> {}` | `{} -> {}` | **{}** | `{} / {}` | `{:.1}B / {:.1}B` | `{} / {}` | {} |\n",
             tv.local_ip,
@@ -179,6 +278,11 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
             tv.bfd_state,
             tv.detect_multiplier,
             tv.reason
+        ));
+    }
+    if hidden_standby > 0 {
+        md.push_str(&format!(
+            "\n*Plus `{hidden_standby}` idle `STANDBY (BFD HEARTBEAT ONLY)` tunnels hidden (pass `--peer <ip>` or `--all-tunnels` to inspect all).*\n"
         ));
     }
 
