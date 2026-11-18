@@ -1,19 +1,134 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::time::Duration;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::Utc;
-use reqwest::Client;
 use serde_json::Value;
 
-use crate::models::{OmpRouteEntry, RouterSnapshot, TlocEntry, TunnelDiag};
+use crate::models::{
+    runtime_scratch_dir, utc_now_rfc3339, OmpRouteEntry, RouterSnapshot, TlocEntry, TunnelDiag,
+};
 use crate::parsers::{compute_tunnel_averages, is_route_chosen_installed, merge_tunnel_diags, parse_running_config_sdwan};
 
-/// Authenticated Cisco Catalyst SD-WAN vManage REST client.
+struct CookieJarGuard {
+    path: PathBuf,
+}
+
+impl CookieJarGuard {
+    fn create() -> Result<Self, String> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = runtime_scratch_dir()
+            .join(format!("tloc-cookie-{}-{}.txt", std::process::id(), nanos));
+        let _ = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| format!("Failed creating cookie jar '{}': {e}", path.display()))?;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        Ok(Self { path })
+    }
+}
+
+impl Drop for CookieJarGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn curl_request(
+    base_url: &str,
+    path: &str,
+    jar_path: &Path,
+    write_cookies: bool,
+    insecure: bool,
+    xsrf_token: Option<&str>,
+    post_body: Option<&str>,
+) -> Result<(u16, String), String> {
+    let url = format!("{base_url}{path}");
+    let mut cmd = Command::new("curl");
+    cmd.arg("-sS")
+        .arg("--max-time")
+        .arg("20")
+        .arg("-b")
+        .arg(jar_path);
+    if write_cookies {
+        cmd.arg("-c").arg(jar_path);
+    }
+    if insecure {
+        cmd.arg("-k");
+    }
+    if let Some(tok) = xsrf_token.filter(|t| !t.is_empty()) {
+        cmd.arg("-H").arg(format!("X-XSRF-TOKEN: {tok}"));
+    }
+    cmd.arg("-w").arg("\n%{http_code}");
+
+    if post_body.is_some() {
+        cmd.arg("-X")
+            .arg("POST")
+            .arg("-H")
+            .arg("Content-Type: application/x-www-form-urlencoded")
+            .arg("--data-binary")
+            .arg("@-")
+            .stdin(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::null());
+    }
+
+    cmd.arg(url).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed launching curl for {path}: {e}"))?;
+
+    if let Some(body) = post_body {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(body.as_bytes())
+                .map_err(|e| format!("Failed writing POST body to curl: {e}"))?;
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("curl execution failed for {path}: {e}"))?;
+    let raw = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    if !output.status.success() {
+        return Err(format!("curl {path} failed: {stderr}"));
+    }
+
+    let (body, code_str) = raw
+        .rsplit_once('\n')
+        .unwrap_or((raw.as_str(), "0"));
+    let status = code_str.trim().parse::<u16>().unwrap_or(0);
+    Ok((status, body.to_string()))
+}
+
+/// Authenticated Cisco Catalyst SD-WAN vManage REST client (backed by native `curl`).
 pub struct VManageClient {
     base_url: String,
-    client: Client,
     xsrf_token: String,
+    insecure: bool,
+    cookie_jar: CookieJarGuard,
 }
 
 #[derive(Debug, Clone)]
@@ -26,7 +141,7 @@ pub struct VManageDeviceSummary {
 }
 
 impl VManageClient {
-    pub async fn connect(
+    pub fn connect(
         host: &str,
         user: &str,
         password: &str,
@@ -43,60 +158,78 @@ impl VManageClient {
             format!("https://{normalized}:8443")
         };
 
-        let client = Client::builder()
-            .cookie_store(true)
-            .danger_accept_invalid_certs(insecure)
-            .timeout(Duration::from_secs(20))
-            .build()
-            .map_err(|e| format!("Failed building HTTP client: {e}"))?;
+        let cookie_jar = CookieJarGuard::create()?;
+        let form_body = format!(
+            "j_username={}&j_password={}",
+            percent_encode(user),
+            percent_encode(password)
+        );
+        let (login_status, login_body) = curl_request(
+            &base_url,
+            "/j_security_check",
+            &cookie_jar.path,
+            true,
+            insecure,
+            None,
+            Some(&form_body),
+        )
+        .map_err(|e| format!("vManage login request failed: {e}"))?;
 
-        let login_res = client
-            .post(format!("{base_url}/j_security_check"))
-            .form(&[("j_username", user), ("j_password", password)])
-            .send()
-            .await
-            .map_err(|e| format!("vManage login request failed: {e}"))?;
-
-        let login_body = login_res.text().await.unwrap_or_default();
-        if login_body.contains("j_security_check") || login_body.to_lowercase().contains("<html") {
+        if !(200..400).contains(&login_status)
+            || login_body.contains("j_security_check")
+            || login_body.to_lowercase().contains("<html")
+        {
             return Err(format!("vManage rejected credentials for user '{}'", user));
         }
 
-        let token_res = client
-            .get(format!("{base_url}/dataservice/client/token"))
-            .send()
-            .await
-            .map_err(|e| format!("Failed fetching XSRF token: {e}"))?;
-        let xsrf_token = token_res.text().await.unwrap_or_default().trim().to_string();
-        if xsrf_token.is_empty() || xsrf_token.to_lowercase().contains("<html") {
+        let (tok_status, xsrf_raw) = curl_request(
+            &base_url,
+            "/dataservice/client/token",
+            &cookie_jar.path,
+            true,
+            insecure,
+            None,
+            None,
+        )
+        .map_err(|e| format!("Failed fetching XSRF token: {e}"))?;
+
+        let xsrf_token = xsrf_raw.trim().to_string();
+        if !(200..300).contains(&tok_status)
+            || xsrf_token.is_empty()
+            || xsrf_token.to_lowercase().contains("<html")
+        {
             return Err("vManage did not return a valid X-XSRF-TOKEN".to_string());
         }
 
         Ok(Self {
             base_url,
-            client,
             xsrf_token,
+            insecure,
+            cookie_jar,
         })
     }
 
-    pub async fn get_json(&self, path: &str) -> Result<Value, String> {
-        let resp = self
-            .client
-            .get(format!("{}{path}", self.base_url))
-            .header("X-XSRF-TOKEN", &self.xsrf_token)
-            .send()
-            .await
-            .map_err(|e| format!("GET {path} failed: {e}"))?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(format!("GET {path} -> HTTP {status}: {}", text.chars().take(200).collect::<String>()));
+    pub fn get_json(&self, path: &str) -> Result<Value, String> {
+        let (status, text) = curl_request(
+            &self.base_url,
+            path,
+            &self.cookie_jar.path,
+            false,
+            self.insecure,
+            Some(&self.xsrf_token),
+            None,
+        )?;
+        if !(200..300).contains(&status) {
+            return Err(format!(
+                "GET {path} -> HTTP {status}: {}",
+                text.chars().take(200).collect::<String>()
+            ));
         }
         serde_json::from_str(&text).map_err(|e| format!("Invalid JSON from {path}: {e}"))
     }
 
-    pub async fn list_wan_edges(&self) -> Result<Vec<VManageDeviceSummary>, String> {
-        let val = self.get_json("/dataservice/system/device/vedges").await?;
+    pub fn list_wan_edges(&self) -> Result<Vec<VManageDeviceSummary>, String> {
+        let val = self.get_json("/dataservice/system/device/vedges")?;
         let rows = val.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
         let mut out = Vec::new();
         for r in rows {
@@ -115,7 +248,7 @@ impl VManageClient {
         Ok(out)
     }
 
-    pub async fn collect_device_snapshot(
+    pub fn collect_device_snapshot(
         &self,
         dev: &VManageDeviceSummary,
         vpn_id: &str,
@@ -131,15 +264,25 @@ impl VManageClient {
         let p_tun = format!("/dataservice/device/tunnel/statistics?deviceId={sys_ip}");
         let p_app = format!("/dataservice/device/app-route/statistics?deviceId={sys_ip}");
 
-        let (cfg_res, tloc_adv_res, tloc_recv_res, routes_res, bfd_res, tun_res, app_res) = tokio::join!(
-            self.get_json(&p_cfg),
-            self.get_json(&p_tloc_adv),
-            self.get_json(&p_tloc_recv),
-            self.get_json(&p_routes),
-            self.get_json(&p_bfd),
-            self.get_json(&p_tun),
-            self.get_json(&p_app),
-        );
+        let (cfg_res, tloc_adv_res, tloc_recv_res, routes_res, bfd_res, tun_res, app_res) =
+            std::thread::scope(|s| {
+                let h_cfg = s.spawn(|| self.get_json(&p_cfg));
+                let h_adv = s.spawn(|| self.get_json(&p_tloc_adv));
+                let h_recv = s.spawn(|| self.get_json(&p_tloc_recv));
+                let h_routes = s.spawn(|| self.get_json(&p_routes));
+                let h_bfd = s.spawn(|| self.get_json(&p_bfd));
+                let h_tun = s.spawn(|| self.get_json(&p_tun));
+                let h_app = s.spawn(|| self.get_json(&p_app));
+                (
+                    h_cfg.join().unwrap_or_else(|_| Err("cfg request panicked".into())),
+                    h_adv.join().unwrap_or_else(|_| Err("tloc adv request panicked".into())),
+                    h_recv.join().unwrap_or_else(|_| Err("tloc recv request panicked".into())),
+                    h_routes.join().unwrap_or_else(|_| Err("routes request panicked".into())),
+                    h_bfd.join().unwrap_or_else(|_| Err("bfd request panicked".into())),
+                    h_tun.join().unwrap_or_else(|_| Err("tunnel request panicked".into())),
+                    h_app.join().unwrap_or_else(|_| Err("app-route request panicked".into())),
+                )
+            });
 
         let running_text = cfg_res
             .ok()
@@ -179,7 +322,7 @@ impl VManageClient {
             system_ip: dev.system_ip.clone(),
             site_id: dev.site_id.clone(),
             source_mode: "vmanage".to_string(),
-            captured_at_utc: Utc::now().to_rfc3339(),
+            captured_at_utc: utc_now_rfc3339(),
             local_tlocs,
             remote_tlocs,
             omp_routes,

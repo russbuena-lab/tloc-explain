@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 
-use crate::models::RouterSnapshot;
+use crate::models::{runtime_scratch_dir, RouterSnapshot};
 use crate::parsers::{build_snapshot_from_text, parse_omp_routes, parse_omp_tlocs};
 
 /// Validates that every CLI command sent over SSH is strictly read-only.
@@ -39,7 +39,8 @@ impl AskpassGuard {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("tloc-askpass-{}-{}.sh", std::process::id(), nanos));
+        let path = runtime_scratch_dir()
+            .join(format!("tloc-askpass-{}-{}.sh", std::process::id(), nanos));
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create_new(true)

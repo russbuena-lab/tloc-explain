@@ -1,4 +1,50 @@
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
+
+/// Returns the current UTC timestamp formatted as RFC 3339 (`YYYY-MM-DDTHH:MM:SSZ`).
+pub fn utc_now_rfc3339() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let sec = rem % 60;
+
+    // Howard Hinnant's civil_from_days algorithm (days since 1970-01-01)
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// Returns a `0700` user-private runtime scratch directory (`~/.cache/tloc-explain`),
+/// avoiding `/tmp` which may be mounted `noexec` on hardened STIG hosts.
+pub fn runtime_scratch_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            let dir = PathBuf::from(home).join(".cache").join("tloc-explain");
+            if fs::create_dir_all(&dir).is_ok() {
+                let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+                return dir;
+            }
+        }
+    }
+    std::env::temp_dir()
+}
 
 /// Normalized snapshot of a Cisco Catalyst SD-WAN router's TLOCs, OMP routes, BFD sessions,
 /// cumulative tunnel statistics, and rolling app-route SLA statistics.

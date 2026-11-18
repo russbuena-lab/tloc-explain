@@ -303,8 +303,7 @@ fn load_ssh_password(explicit_env: Option<&str>, is_vsmart: bool) -> Option<Stri
     None
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli = match parse_args() {
         Ok(c) => c,
         Err(e) => {
@@ -366,14 +365,14 @@ async fn main() {
                         process::exit(1);
                     }
                 };
-            let client = match VManageClient::connect(&vm_host, &vm_user, &vm_pw, *insecure).await {
+            let client = match VManageClient::connect(&vm_host, &vm_user, &vm_pw, *insecure) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("vManage auth error: {e}");
                     process::exit(1);
                 }
             };
-            let devices = match client.list_wan_edges().await {
+            let devices = match client.list_wan_edges() {
                 Ok(d) => d,
                 Err(e) => {
                     eprintln!("vManage inventory error: {e}");
@@ -401,7 +400,7 @@ async fn main() {
             }
             let mut out = Vec::new();
             for dev in targets {
-                match client.collect_device_snapshot(&dev, vpn).await {
+                match client.collect_device_snapshot(&dev, vpn) {
                     Ok(snap) => out.push(explain_snapshot(snap)),
                     Err(e) => eprintln!("Warning: failed collecting {}: {e}", dev.host_name),
                 }

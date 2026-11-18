@@ -1,9 +1,8 @@
 use std::collections::BTreeMap;
 
-use chrono::Utc;
 use regex::Regex;
 
-use crate::models::{OmpRouteEntry, RouterSnapshot, TlocEntry, TunnelDiag};
+use crate::models::{utc_now_rfc3339, OmpRouteEntry, RouterSnapshot, TlocEntry, TunnelDiag};
 
 /// Parsed local SD-WAN interface attributes extracted from `show sdwan running-config sdwan`.
 #[derive(Debug, Clone, Default)]
@@ -727,7 +726,7 @@ pub fn build_snapshot_from_text(
         system_ip: system_ip.to_string(),
         site_id: site_id.to_string(),
         source_mode: source_mode.to_string(),
-        captured_at_utc: Utc::now().to_rfc3339(),
+        captured_at_utc: utc_now_rfc3339(),
         local_tlocs,
         remote_tlocs,
         omp_routes,

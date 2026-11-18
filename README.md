@@ -17,19 +17,27 @@ Standalone, zero-warning Rust CLI (`x86_64-unknown-linux-musl` static binary) th
   - `BACKUP_TRANSPORT_DATA_BLEED`: Alerts when a non-primary transport carries live user traffic while primary WAN is up.
   - `EQUAL_TLOC_PREFERENCE_ECMP`: Flags identical TLOC preferences causing unintended ECMP onto metered circuits.
   - `REMOTE_TLOC_PREF_UNSET_ZERO` & `BFD_SESSION_DOWN` / `BFD_SESSION_FLAPPED`.
+- **Zero External Build or Runtime Crates Needed:**
+  - Pure-Rust dependency tree (`serde`, `serde_json`, `regex` — zero `ring`, zero `cc`, zero OpenSSL/tokio C-toolchain requirements). All 20 crates are **vendored right in [`vendor/`](vendor/)** with [`.cargo/config.toml`](.cargo/config.toml), alongside a pre-built static [`tloc-explain`](tloc-explain) binary, [`install.sh`](install.sh), and a self-contained Debian package [`dist/tloc-explain_0.1.0_amd64.deb`](dist/tloc-explain_0.1.0_amd64.deb).
 - **Direct Router First (No vManage Required):**
-  - **Direct Router SSH (default):** `tloc-explain <router-ip>` connects straight to a `cEdge` (or `--vsmart`) via native OpenSSH with read-only `show` commands and ephemeral `0700` `SSH_ASKPASS` (zero password exposure on `argv`). Supports `TLOC_SSH_PASS` / `ROUTER_SSH_PASS` (env or `~/.tloc_env` / `/home/russb/code/sdwan-lab/.vmanage_env`), `--password <pw>`, or `--password-env <VAR>`.
+  - **Direct Router SSH (default):** `tloc-explain <router-ip>` connects straight to a `cEdge` (or `--vsmart`) via native OpenSSH with read-only `show` commands and ephemeral `0700` `SSH_ASKPASS` under `~/.cache/tloc-explain/` (safe on DISA STIG `/tmp noexec` hosts, zero password exposure on `argv`). Supports `TLOC_SSH_PASS` / `ROUTER_SSH_PASS` (env or `~/.tloc_env` / `/home/russb/code/sdwan-lab/.vmanage_env`), `--password <pw>`, or `--password-env <VAR>`.
   - **`file`:** Parses offline CLI captures cleanly.
-  - **`vmanage` (optional):** Queries `vManage` real-time APIs concurrently (`tokio::join!`) across one device or `--device all`.
+  - **`vmanage` (optional):** Queries `vManage` real-time APIs concurrently (`std::thread::scope` + native `curl`, no `reqwest`/`rustls` crates required) across one device or `--device all`.
 
-## Build & Install
+## Install (Offline / Zero-Dependency Options)
+
+Choose any method — all dependencies are carried inside the repo:
 
 ```bash
-cargo check
-cargo clippy -- -D warnings
-cargo test
-CC_x86_64_unknown_linux_musl=gcc cargo build --release --target x86_64-unknown-linux-musl
-cp target/x86_64-unknown-linux-musl/release/tloc-explain ~/.local/bin/tloc-explain
+# Option 1: Install pre-built static binary directly (no Rust toolchain needed)
+./install.sh
+
+# Option 2: Install self-contained Debian/Ubuntu .deb package
+sudo dpkg -i dist/tloc-explain_0.1.0_amd64.deb
+
+# Option 3: Rebuild completely offline from vendored crates in ./vendor
+./install.sh --build
+# or: cargo build --release --offline
 ```
 
 ## Usage Examples
